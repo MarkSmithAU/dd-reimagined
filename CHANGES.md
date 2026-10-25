@@ -1,5 +1,12 @@
 # Changes
 
+## 1.0.1 (2026-10-25)
+
+Documentation only; the programs are unchanged apart from their version.
+
+- README.md has a **Motivation** section and a **disclaimer**: the
+  software is used at your own risk, with no warranty or liability.
+
 ## 1.0.0 (2026-10-19)
 
 The first release of dd reimagined for Windows: a rewrite in C of John

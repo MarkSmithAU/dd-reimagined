@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # The version itself is set in include/dd_version.h; keep this in step.
-project(dd_windows VERSION 1.0.0 LANGUAGES C)
+project(dd_windows VERSION 1.0.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

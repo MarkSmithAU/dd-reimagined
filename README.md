@@ -2,7 +2,7 @@
 
 ## Motivation
 
-Most disk imaging software aimed at external storage is focused on the individual tasks and does not integrate them into a streamlined process.  This program was borne out of a desire to have a perfect solution for reading and writing image files, with the workflow that I would normally perform including clearing free space, a raw image read and then compression, as well as writing back to a drive safely for restoration. The core of the design is a streaming pipeline to handle all the operations without intermediate files. This enables new functionality such as old images through this program and re-process it (i.e. sparse-process an existing image file and then compress it). 
+Most disk imaging software aimed at external storage is focused on the individual tasks and does not integrate them into a streamlined process.  This program was borne out of a desire to have a perfect solution for reading and writing image files, with the workflow that I would normally perform including clearing free space, a raw image read and then compression, as well as writing back to a drive safely for restoration. The core of the design is a streaming pipeline to handle all the operations without intermediate files. This enables new functionality such as reprocessing old images through this program (i.e. sparse-process an existing image file and then compress it). 
 
 ## Absolute Disclaimer of Any Warranty or Liability - Use At Your Own Risk
 
@@ -14,7 +14,7 @@ If you cannot agree with the above, do not use it.
 
 ## About
 
-Version 1.0.0. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
+Version 1.0.1. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
 behaves like GNU dd, keeps 0.6's Windows extras (`--list`, `id=`/`od=`,
 `--filter`, `dd-<filter>.exe` naming) and adds a graphical front end and
 the features below.
@@ -31,7 +31,7 @@ the features below.
 
 ## Features
 
-- **Safe disk writing.** Volumes are locked, dismounted and lose their
+- **Guarded disk writing.** Volumes are locked, dismounted and lose their
   drive letters during the copy. The disks Windows runs and boots from
   are never written. Disks are opened by device path, so one plugged in
   during a confirmation cannot receive the write.
