@@ -2,7 +2,15 @@
 
 ## Motivation
 
-<!-- To be written. -->
+Most disk imaging software aimed at external storage is focused on the individual tasks and does not integrate them into a streamlined process.  This program was borne out of a desire to have a perfect solution for reading and writing image files, with the workflow that I would normally perform including clearing free space, a raw image read and then compression, as well as writing back to a drive safely for restoration. The core of the design is a streaming pipeline to handle all the operations without intermediate files. This enables new functionality such as old images through this program and re-process it (i.e. sparse-process an existing image file and then compress it). 
+
+## Absolute Disclaimer of Any Warranty or Liability - Use At Your Own Risk
+
+The actions this program is capable of are destructive, either from incorrect usage or due to bugs.  
+
+While every effort has been made to check for bugs and adding safeguards, including a comprehensive test suite, you use this software AT YOUR OWN RISK.
+
+If you cannot agree with the above, do not use it.
 
 ## About
 
