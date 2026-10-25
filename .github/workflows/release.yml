@@ -1,0 +1,48 @@
+# Builds the release zips when a GitHub release is published, and attaches
+# them (with SHA256SUMS) to it.  The release's tag must be the version in
+# include\dd_version.h, with or without a leading v (v1.0.0 or 1.0.0).
+#
+# release.ps1 does the work: it checks the versions agree, does a clean
+# build, runs the file-only test suites and makes the zips in dist\.  The
+# device and GUI suites need VHDXs and a desktop, so run tests\run-all.ps1
+# elevated on a test machine before publishing.
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  zips:
+    runs-on: windows-latest
+    steps:
+      # keep LF line endings, so the source zip matches the repository
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Check the tag is the version
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $h = Get-Content include\dd_version.h -Raw
+          if ($h -notmatch '#define DD_VERSION_STR\s+"([^"]+)"') { throw 'no DD_VERSION_STR in include\dd_version.h' }
+          $ver = $Matches[1]
+          if ($env:TAG -ne $ver -and $env:TAG -ne "v$ver") { throw "tag $env:TAG is not version $ver (want v$ver or $ver)" }
+
+      - name: Build, test and package
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attach the zips to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload $env:TAG (Get-ChildItem dist).FullName --clobber

@@ -1,0 +1,12 @@
+# build.cmd and `cmake -B build`: the programs, objects and liblzma
+# (build\lzma.lib, compiled from third_party\xz; nothing is downloaded)
+build/
+# release.ps1: the zips and SHA256SUMS
+dist/
+# tests\regenerate-fixtures.ps1: the ext and NTFS images the sparse suites use
+tests/fixtures/
+# Visual Studio's Open Folder and its CMake integration
+.vs/
+out/
+# per-machine editor settings (they hold this checkout's local path)
+.vscode/settings.json
