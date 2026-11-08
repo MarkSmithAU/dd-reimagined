@@ -197,8 +197,13 @@ try {
     $null = $p.Handle                   # without it, ExitCode stays empty
     $ended = $p.WaitForExit(30000)
     if (-not $ended) { $p.Kill() }
-    Check 'damaged .xz with conv=noerror,sync: fails, and ends' ($ended -and $p.ExitCode -eq 1 -and (Get-Item (F 'bad.out')).Length -le 4MB -and
-        (Get-Content (F 'bad.err') -Raw) -match 'error reading') "ended: $ended"
+    Check 'damaged .xz with conv=noerror,sync: fails, ends, and deletes the incomplete output' ($ended -and $p.ExitCode -eq 1 -and
+        -not (Test-Path (F 'bad.out')) -and (Get-Content (F 'bad.err') -Raw) -match 'error reading') "ended: $ended"
+    $r = DDRun "if=bad.xz of=kept.out --keep-incomplete"
+    Check '... --keep-incomplete keeps it' ($r.Code -eq 1 -and (Test-Path (F 'kept.out')) -and (Get-Item (F 'kept.out')).Length -le 4MB) $r.Err
+    Copy-Item (F 'a.img') (F 'notrunc.out')
+    $r = DDRun "if=bad.xz of=notrunc.out conv=notrunc"
+    Check '... as is a file written with conv=notrunc, which held more than this run' ($r.Code -eq 1 -and (Test-Path (F 'notrunc.out'))) $r.Err
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }

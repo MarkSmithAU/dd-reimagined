@@ -94,7 +94,7 @@ static void format_phase(const dd_stats *s, wchar_t *line, size_t n)
 {
     wchar_t done[32], total[32], rate[32];
     const wchar_t *what = s->phase == DD_PHASE_VERIFY ? L"verified"
-                        : s->phase == DD_PHASE_MAP ? (s->phase_total > 0 ? L"hashed" : L"decompressed")
+                        : s->phase == DD_PHASE_MAP ? L"mapping: decompressed"
                         : L"checked";
 
     dd_format_size(s->phase_done, false, done, 32);
@@ -261,12 +261,9 @@ static void usage(void)
            L"                  file).  Partition tables, gaps and other partitions are\n"
            L"                  read as usual.  A file system not cleanly unmounted is\n"
            L"                  read whole.  With --layout, shows what would be read.\n"
-           L"                  An xz-compressed if= is read in order, so it needs its file\n"
-           L"                  systems mapped first, by --make-sparse-map; its free space\n"
-           L"                  is then read and written as zeros\n"
-           L"  --make-sparse-map  map the file systems of if=, an xz-compressed image, and\n"
-           L"                  write what --sparse-read needs to IMAGE.sparse (named as\n"
-           L"                  the hash file is), bound to the .xz file by its SHA-256\n"
+           L"                  An xz-compressed if= is read in order, so its file systems\n"
+           L"                  are mapped first, decompressing the parts they need; its\n"
+           L"                  free space is then read and written as zeros\n"
            L"  --allow-unclean with --sparse-read, map file systems that were not cleanly\n"
            L"                  unmounted too, counting everything that may be in use\n"
            L"                  (ext3/4: what the journal holds; FAT: every FAT copy).\n"
@@ -295,6 +292,9 @@ static void usage(void)
            L"  --verify        after the copy, read the output back (unbuffered) and check\n"
            L"                  it holds exactly what was written; an .xz output is\n"
            L"                  decompressed again\n"
+           L"  --keep-incomplete  keep an output file the copy stopped or failed in; by\n"
+           L"                  default it is deleted when all of it is this run's (no\n"
+           L"                  seek=, conv=notrunc or oflag=append)\n"
            L"  --verify-hashes check if= (an image) against its hash file and exit; nothing\n"
            L"                  is written\n"
            L"  --progress      same as status=progress\n"
@@ -479,48 +479,38 @@ static void print_fs_report(const dd_fs_report *r, const wchar_t *heading)
            used, size, (long long)r->read, (long long)r->size);
 }
 
-/* --layout --sparse-read: the file systems, and how much of each is read */
+/* --layout --sparse-read: the file systems, and how much of each is read.
+   A compressed image is mapped now, which can take a while: progress as
+   for a copy, and Ctrl+C stops it. */
 static int show_file_systems(const wchar_t *path, bool allow_unclean)
 {
     dd_fs_report *r = malloc(sizeof *r);
     wchar_t err[512];
+    dd_callbacks cb;
+    dd_stats st;
+    bool ok;
 
     if (!r) {
         eprint(L"dd: memory exhausted\n");
         return 1;
     }
-    if (!dd_fs_report_read(path, allow_unclean, r, err, 512)) {
+    dd_cancel_init(&g_cancel);
+    SetConsoleCtrlHandler(on_ctrl, TRUE);
+    memset(&cb, 0, sizeof cb);
+    cb.message = on_message;
+    cb.progress = on_progress;
+    cb.progress_interval_ms = g_status == DD_STATUS_PROGRESS ? 1000 : 0;
+    memset(&st, 0, sizeof st);
+    ok = dd_fs_report_read(path, allow_unclean, &cb, &g_cancel, &st, r, err, 512);
+    end_progress_line();
+    if (!ok) {
         eprint(L"dd: %ls\n", err);
         free(r);
-        return 1;
+        return g_cancel.requested ? 130 : 1;
     }
     print_fs_report(r, allow_unclean ? L"File systems (--sparse-read --allow-unclean)" : L"File systems (--sparse-read)");
     free(r);
     return 0;
-}
-
-/* --make-sparse-map: maps a compressed image's file systems, for --sparse-read */
-static int make_sparse_map(const wchar_t *path, bool allow_unclean, const dd_callbacks *cb)
-{
-    dd_fs_report *r = malloc(sizeof *r);
-    dd_stats st;
-    dd_result res;
-
-    if (!r) {
-        eprint(L"dd: memory exhausted\n");
-        return 1;
-    }
-    if (!path || wcscmp(path, L"-") == 0) {
-        eprint(L"dd: --make-sparse-map needs if=, an xz-compressed image\n");
-        free(r);
-        return 1;
-    }
-    res = dd_make_sparse_map(path, allow_unclean, cb, &g_cancel, &st, r);
-    end_progress_line();
-    if (res == DD_OK)
-        print_fs_report(r, L"File systems, as the sparse map records them");
-    free(r);
-    return res == DD_CANCELLED ? 130 : res == DD_OK ? 0 : 1;
 }
 
 static int show_layout(const wchar_t *path, const wchar_t *name)
@@ -640,7 +630,7 @@ int wmain(int argc, wchar_t **argv)
 {
     static wchar_t id_path[MAX_PATH], od_path[MAX_PATH], id_name[MAX_PATH], od_name[MAX_PATH];
     const wchar_t *id = NULL, *od = NULL;
-    bool list = false, layout = false, status_given = false, no_xz = false, make_map = false;
+    bool list = false, layout = false, status_given = false, no_xz = false;
     int64_t drive_bs = 0;
     wchar_t err[512];
     dd_callbacks cb;
@@ -680,8 +670,6 @@ int wmain(int argc, wchar_t **argv)
             opt.keep_letters = true;
         } else if (wcscmp(a, L"--sparse-read") == 0) {
             opt.sparse_read = true;
-        } else if (wcscmp(a, L"--make-sparse-map") == 0) {
-            make_map = true;
         } else if (wcscmp(a, L"--allow-unclean") == 0) {
             opt.sparse_unclean = true;
         } else if (wcscmp(a, L"--fit") == 0) {
@@ -692,6 +680,8 @@ int wmain(int argc, wchar_t **argv)
             opt.hashes = DD_HASHES_OFF;
         } else if (wcscmp(a, L"--verify") == 0) {
             opt.verify = true;
+        } else if (wcscmp(a, L"--keep-incomplete") == 0) {
+            opt.keep_incomplete = true;
         } else if (wcscmp(a, L"--verify-hashes") == 0) {
             opt.check_hashes = true;
         } else if (wcscmp(a, L"--xz") == 0) {
@@ -763,6 +753,7 @@ int wmain(int argc, wchar_t **argv)
             return 1;
         }
         rc = show_layout(opt.input, opt.input_name ? opt.input_name : opt.input);
+        g_status = opt.status;
         if (rc == 0 && opt.sparse_read)
             rc = show_file_systems(opt.input, opt.sparse_unclean);
         return rc;
@@ -790,8 +781,6 @@ int wmain(int argc, wchar_t **argv)
     cb.message = on_message;
     cb.progress = on_progress;
     cb.progress_interval_ms = opt.status == DD_STATUS_PROGRESS ? 1000 : 0;
-    if (make_map)
-        return make_sparse_map(opt.input, opt.sparse_unclean, &cb);
 
     r = dd_run(&opt, &cb, &g_cancel, &st);
     if (st.started && !opt.check_hashes)

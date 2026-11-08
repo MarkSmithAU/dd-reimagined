@@ -27,8 +27,8 @@
 #define IDC_SRCFILE     1029
 #define IDC_BROWSE_SRC  1030
 #define IDC_DISK2       1031
-#define IDC_MAKEMAP     1034
 #define IDC_INPUT       1035
 #define IDC_OUTPUT      1036
 #define IDC_SRCNOTE     1037
 #define IDC_DSTNOTE     1038
+#define IDC_DELPARTIAL  1039

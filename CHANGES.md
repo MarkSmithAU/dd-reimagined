@@ -1,5 +1,32 @@
 # Changes
 
+## Unreleased
+
+- **Compressed images are mapped for each run; the sparse map file is
+  gone.** `--sparse-read` on an `.xz` image now maps its file systems at
+  the start of the run, in memory, and holds the file against writers
+  until the copy ends, so the map can never be out of date. Before, a map
+  stored in `disk.img.sparse` was only found to be another image's (by its
+  SHA-256) after the output had been written.
+  - **Removed:** `--make-sparse-map`, and dd-gui.exe's *Make sparse map*
+    button. Old `.sparse` files are ignored and can be deleted.
+  - dd-gui.exe maps a compressed source in the background once *Only used
+    space* is ticked, showing progress in the *Sparse read* column; the
+    window stays usable, and Start stops it.
+- **Stopping a compression is immediate.** Stop or Ctrl+C no longer waits
+  for the encoder threads to finish the blocks they hold, which at level 9
+  could take minutes. The .xz file is left without its end, so it will not
+  decompress fully, and dd warns that it is incomplete. A copy that fails
+  for any other reason still ends the stream.
+- **An output file left incomplete is deleted.** When a copy fails or is
+  stopped while writing a file that is all its own (no `seek=`,
+  `conv=notrunc` or `oflag=append`), the partial file is deleted and dd
+  says so. `--keep-incomplete` keeps it; dd-gui.exe's *Delete the image
+  file if stopped or failed*, ticked by default, is the same switch. A
+  file whose copy finished is kept, even if verifying it fails.
+- dd-gui.exe shows the read rate while verifying, checking hashes or
+  mapping a compressed image, as dd.exe already did.
+
 ## 1.0.1 (2026-10-25)
 
 Documentation only; the programs are unchanged apart from their version.

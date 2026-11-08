@@ -64,7 +64,7 @@ end fills in `dd_options` and supplies `dd_callbacks`:
 - `dd_cancel_request()` works from any thread and also aborts a blocked
   read or write, for example on a pipe.
 
-`gui/gui.c` shows the pattern: `dd_run()` (or `dd_make_sparse_map()`) on a
+`gui/gui.c` shows the pattern: `dd_run()` on a
 worker thread, callbacks posting window messages to the UI thread,
 `dd_options` filled in directly rather than by parsing text, the device
 picker from `dd_list_devices()`, the *Sparse read* column from
@@ -88,14 +88,14 @@ compiled from `third_party/xz`.
 | Suite | Checks | Needs | Covers |
 |---|---|---|---|
 | run-tests | 70 | — | GNU semantics, suffixes, conversions, pipes, filters, --help/--version/--list |
-| xz-tests | 32 | — | every level, stdout, concatenated, corrupt and truncated streams, --fit through .xz, idle priority, memory budget |
+| xz-tests | 34 | — | every level, stdout, concatenated, corrupt and truncated streams, incomplete output deleted or kept, --fit through .xz, idle priority, memory budget |
 | hash-tests | 41 | — | .hashes files, --verify on files, --verify-hashes |
 | device-tests | 51 | admin | 64 MB VHDX: locking, force-dismount, --lock-input, drive letters, --keep-letters, system-disk refusal, read-modify-write, interface paths, verify |
-| ctrlc-test | 5 | admin | real Ctrl+C: stats, exit 130, blocked pipe read released |
+| ctrlc-test | 8 | admin | real Ctrl+C: stats, exit 130, blocked pipe read released, compression stopped at once |
 | gui-race-test | 6 | admin | disks swapped or added while the GUI's confirmation is open |
 | fit-tests | 50 | admin | --fit for MBR and GPT, both directions, through .xz and hashes; clearing an old backup GPT |
-| gui-fit-test | 70 | admin | the GUI end to end: lists, read, write, check, Command line, lock, Sparse read, image to image (.xz, sparse, sparse map), disk to disk, read tests, wipes |
-| sparse-tests | 91 | fixtures | ext2/3/4 against dumpe2fs's free list, journal recovery, damage, MBR, overlap, options; .xz maps and streaming, hash files; NTFS against Windows' bitmap; swap |
+| gui-fit-test | 70 | admin | the GUI end to end: lists, read, write, check, Command line, lock, Sparse read, image to image (.xz, sparse, mapping in the background), disk to disk, read tests, wipes |
+| sparse-tests | 86 | fixtures | ext2/3/4 against dumpe2fs's free list, journal recovery, damage, MBR, overlap, options; .xz mapped in memory and streamed, hash files; NTFS against Windows' bitmap; swap |
 | sparse-device-tests | 43 | admin, fixtures | Windows-formatted FAT12/16/32, exFAT, NTFS plus ext4 on one VHDX: read, written back, chkdsk, file hashes; dirty bits; mounted volumes |
 
 `tests\run-all.ps1` runs all ten suites, one line each. For 1.0.0 it
@@ -201,7 +201,7 @@ which asks for elevation, until it has a signature or a reputation.
 
 - **Engine/front-end split.** `ddcore` never prints; it reports through
   `dd_callbacks`. `dd_cancel_request()` is thread-safe and calls
-  CancelSynchronousIo. The GUI runs `dd_run` (or `dd_make_sparse_map`) on
+  CancelSynchronousIo. The GUI runs `dd_run` on
   a worker thread and posts WM_APP messages back.
   - GUI input and output (`src`, `dst` in gui.c): the Input list
     (`IDC_INPUT`) picks a disk, image file, zeros or random data; the
@@ -367,8 +367,13 @@ which asks for elevation, until it has a signature or a reputation.
     if everything was read.
   - An uncompressed input's hash file is not checked (free space reads as
     zeros), and `setup_output` leaves a shared one alone (see Hash files).
-  - **Compressed inputs** are mapped beforehand (`dd_make_sparse_map`,
-    `--make-sparse-map`, the GUI button) into `disk.img.sparse`:
+  - **Compressed inputs** are mapped at the start of each run, in memory
+    only (`setup_sparse_stream` in copy.c, `dd__fsmap_build_xz` in
+    fsmap.c); nothing is stored beside the image:
+    - `dd__fs_hold` opens the .xz again, readers only, and the copy keeps
+      that handle until `dd_run` ends: no one can write the file from
+      mapping to the end of the copy, and a file another program has open
+      to write is refused. So the map needs no hash binding it to the file.
     - `dd__xz_seek` (xz.c) reads .xz out of order: it finds the block for
       an offset in the index (`lzma_index_iter_locate`), decodes its
       header and runs `lzma_block_decoder` from there, caching 64 1 MiB
@@ -378,21 +383,19 @@ which asks for elevation, until it has a signature or a reputation.
     - The `lzma_block` lives in its struct, not on the stack: liblzma's
       block decoder points to it until the block ends. The block size must
       match the index, and its decoder fit a quarter of free memory.
-    - The .sparse file (text; `save_map`/`dd__fsmap_load`, format 2) holds
-      the .xz's SHA-256 and sizes, `unclean`, the report's `volume` lines
-      and `free <offset> <length>` ranges, then `check <SHA-256 of all
-      above>` and `end`. Loading checks the free ranges lie in sparse
-      volumes and sum to each one's size less used; each becomes a
-      `free_run` region.
-    - A failed read while mapping fails `dd_make_sparse_map` (in a
-      compressed file it means damage) rather than giving a map that reads
-      parts whole without saying why.
-    - The copy (`setup_sparse_stream`) reads in order and zeroes free
-      ranges after hashing (`zero_free`), so the input's .hashes still
-      check. The map's SHA-256 is checked like a hash-file entry
-      (`raw_want_from` names the map), draining the input if need be; a
-      .hashes entry for the .xz must agree up front. Sizes are checked
-      before anything is opened for writing.
+    - Mapping reports `DD_PHASE_MAP` (bytes decompressed; no total) before
+      the copy starts, and stops on `dd_cancel_request`.
+    - A failed read while mapping fails the run (in a compressed file it
+      means damage) rather than giving a map that reads parts whole
+      without saying why.
+    - The copy reads in order and zeroes free ranges after hashing
+      (`zero_free`), so the input's .hashes still check.
+    - The GUI maps a compressed source on a thread of its own once *Only
+      used space* is ticked (`map_compressed`, `map_thread`), for the
+      *Sparse read* column only, and keeps the last result while the
+      file's name, size, time written and *Allow unclean* are the same.
+      Start stops it (`run_worker`); a job the window gave up on is freed
+      when its thread posts `WM_APP_MAPPED`.
     - `ep_read` advances `pos` (uncompressed) for .xz input too, for
       `zero_free` and `expected_total`.
   - **Unclean** file systems are read whole unless `--allow-unclean`. Then

@@ -45,13 +45,17 @@ dd-gui.exe; locking and dismounting before writing, removing drive letters
 meanwhile; protection of the Windows disks; disks opened by device path;
 `--lock-input`, `--force-dismount` and `--keep-letters`; `--layout` and
 `--fit`; `.xz` images; hash files, `--verify` and `--verify-hashes`;
-`--sparse-read`, `--allow-unclean` and `--make-sparse-map`. See
+`--sparse-read` and `--allow-unclean`. See
 [CHANGES.md](../CHANGES.md).
 
 ## Changed
 
 dd uses only documented Windows APIs (SetupAPI, the Volume API, storage
 IOCTLs; no ntdll). No startup banner; use `--version`.
+
+An output file left incomplete by a failure or Ctrl+C is deleted, when all
+of it was written by that run (no `seek=`, `conv=notrunc` or
+`oflag=append`); 0.6 and GNU dd keep it. `--keep-incomplete` keeps it.
 
 ## Removed
 

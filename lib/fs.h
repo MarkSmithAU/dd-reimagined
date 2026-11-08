@@ -120,18 +120,18 @@ typedef struct dd__fs_source {
    system that cannot be read is not an error: it is read whole. */
 dd__fsmap *dd__fsmap_build(const dd__fs_source *src, bool allow_unclean, dd_fs_report *rep, DWORD *err);
 
-/* A stored map (an image's .sparse file): what it was made for. */
-typedef struct dd__map_id {
-    uint8_t sha256[32];             /* of the image file as stored (the .xz) */
-    int64_t file_size;              /* the .xz file */
-    int64_t image_size;             /* uncompressed */
-    bool    unclean;                /* made with --allow-unclean */
-} dd__map_id;
-
-/* Reads a .sparse file.  NULL with *err: ERROR_FILE_NOT_FOUND or
-   ERROR_PATH_NOT_FOUND if there is none, ERROR_INVALID_DATA if it is
-   damaged.  rep may be NULL. */
-dd__fsmap *dd__fsmap_load(const wchar_t *path, dd__map_id *id, dd_fs_report *rep, DWORD *err);
+/* Opens a file to read, refusing writers while it is open (and refused
+   if a writer has it open), so what is mapped stays what is read. */
+HANDLE dd__fs_hold(const wchar_t *path, DWORD *err);
+/* Maps a compressed image file, h from dd__fs_hold: decompresses the .xz
+   blocks its file systems need, out of order.
+   image_size, if not -1, is the uncompressed size the caller expects.
+   Progress goes to cb as DD_PHASE_MAP in st (both may be NULL), and
+   cancel stops it.  NULL with *err: ERROR_OPERATION_ABORTED when
+   cancelled; a failed read means the file is damaged, so it fails the
+   map rather than being read whole. */
+dd__fsmap *dd__fsmap_build_xz(HANDLE h, int64_t image_size, bool allow_unclean, const dd_callbacks *cb,
+                              dd_cancel *cancel, dd_stats *st, dd_fs_report *rep, DWORD *err);
 /* Whether the byte at pos is in use, and how many bytes from pos (at
    most max) have the same answer. */
 int64_t    dd__fsmap_run(const dd__fsmap *m, int64_t pos, int64_t max, bool *used);

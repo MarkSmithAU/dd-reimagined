@@ -78,7 +78,6 @@ disk, its size and drive letters.
     dd --layout if=card.img.xz                        show an image's partition table
     dd --verify-hashes if=card.img.xz                 check an image against its hash file
     dd if=card.img.xz od=E: --fit --verify            write it back and read it back
-    dd if=card.img.xz --make-sparse-map               map a compressed image for --sparse-read
 
 `dd --help` lists every operand and option.
 
