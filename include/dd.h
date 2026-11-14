@@ -133,7 +133,8 @@ typedef struct dd_options {
                                 failed in.  By default it is deleted, when
                                 all of it is this run's: a file dd opened,
                                 with no seek, conv=notrunc or oflag=append.
-                                A file whose copy finished (verify failing,
+                                A file whose copy reached the end (read errors
+                                skipped by conv=noerror, verify failing,
                                 say) is kept. */
     bool check_hashes;       /* only read if= (an image file) and check it
                                 against its .hashes file; no output */

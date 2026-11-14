@@ -14,7 +14,7 @@ If you cannot agree with the above, do not use it.
 
 ## About
 
-Version 1.0.1. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
+Version 1.0.2. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
 behaves like GNU dd, keeps 0.6's Windows extras (`--list`, `id=`/`od=`,
 `--filter`, `dd-<filter>.exe` naming) and adds a graphical front end and
 the features below.

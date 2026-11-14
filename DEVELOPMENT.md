@@ -92,10 +92,10 @@ compiled from `third_party/xz`.
 | hash-tests | 41 | — | .hashes files, --verify on files, --verify-hashes |
 | device-tests | 51 | admin | 64 MB VHDX: locking, force-dismount, --lock-input, drive letters, --keep-letters, system-disk refusal, read-modify-write, interface paths, verify |
 | ctrlc-test | 8 | admin | real Ctrl+C: stats, exit 130, blocked pipe read released, compression stopped at once |
-| gui-race-test | 6 | admin | disks swapped or added while the GUI's confirmation is open |
+| gui-race-test | 9 | admin | disks swapped or added while the GUI's confirmation is open |
 | fit-tests | 50 | admin | --fit for MBR and GPT, both directions, through .xz and hashes; clearing an old backup GPT |
 | gui-fit-test | 70 | admin | the GUI end to end: lists, read, write, check, Command line, lock, Sparse read, image to image (.xz, sparse, mapping in the background), disk to disk, read tests, wipes |
-| sparse-tests | 86 | fixtures | ext2/3/4 against dumpe2fs's free list, journal recovery, damage, MBR, overlap, options; .xz mapped in memory and streamed, hash files; NTFS against Windows' bitmap; swap |
+| sparse-tests | 82 | fixtures | ext2/3/4 against dumpe2fs's free list, journal recovery, damage, MBR, overlap, options; .xz mapped in memory and streamed, hash files; NTFS against Windows' bitmap; swap |
 | sparse-device-tests | 43 | admin, fixtures | Windows-formatted FAT12/16/32, exFAT, NTFS plus ext4 on one VHDX: read, written back, chkdsk, file hashes; dirty bits; mounted volumes |
 
 `tests\run-all.ps1` runs all ten suites, one line each. For 1.0.0 it

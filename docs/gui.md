@@ -82,7 +82,8 @@ Writing:
   deleted (a stopped compression would leave an .xz file with no end,
   which will not decompress fully). The file is kept if the copy never
   started, so a file that was about to be replaced is still whole, and it
-  is kept if the copy finished and only verifying stopped or failed.
+  is kept if the copy reached the end: with read errors skipped, or only
+  verifying stopped or failed.
 
 Both:
 
@@ -136,7 +137,7 @@ The image gets a hash file beside it (`card.img.hashes` for
    verify) is done; if the image replaced them, Windows mounts the new
    ones.
 
-![The finished write: hashes checked, disk verified, letter given to the new volume](images/gui-write-done.png)
+![The finished write: hashes checked, disk verified, the old drive letter kept for its volume](images/gui-write-done.png)
 
 If a disk is plugged in, removed or swapped while the confirmation is
 open, the write is not started; check the disks and press *Start* again.

@@ -816,6 +816,8 @@ static dd_result copy_loop(job *j)
     dd_result res = DD_OK;
     int64_t max_records = -1, max_bytes = 0;
     bool write_stopped = false;
+    bool read_stopped = false;  /* a read error ended it; one conv=noerror skips does not */
+    bool tail_failed = false;   /* what follows the data (sparse end, GPT) failed */
     wchar_t m[256];
     DWORD e;
 
@@ -857,6 +859,7 @@ static dd_result copy_loop(job *j)
             /* nothing after an error in a compressed stream can be found */
             if (!(opt->conv & DD_CONV_NOERROR) || j->in.xz) {
                 res = DD_FAILED;
+                read_stopped = true;
                 break;      /* still write what is already gathered */
             }
             res = DD_FAILED;
@@ -944,13 +947,17 @@ static dd_result copy_loop(job *j)
             dd__msg(j->cb, DD_MSG_ERROR, L"failed to truncate to %lld bytes in output file '%ls': %ls",
                     (long long)j->out.pos, j->out.name, m);
             res = DD_FAILED;
+            tail_failed = true;
         }
     }
 
-    if (res == DD_OK && j->have_gpt)
-        res = write_gpt(j);
-    if (res == DD_OK && j->clear_len)
-        res = clear_end(j);
+    if (res == DD_OK && j->have_gpt && (res = write_gpt(j)) != DD_OK)
+        tail_failed = true;
+    if (res == DD_OK && j->clear_len && (res = clear_end(j)) != DD_OK)
+        tail_failed = true;
+    /* all of the input was copied, even if conv=noerror skipped some of it
+       (and so the result is a failure): the output is as whole as it gets */
+    j->out_complete = !write_stopped && !read_stopped && !tail_failed;
 
     /* Raw devices are always flushed: Windows has no sync command and
        the device may be unplugged as soon as dd exits. */
@@ -1780,7 +1787,6 @@ static dd_result run_job(job *j)
 
     j->st->bytes_total = expected_total(j);
     res = copy_loop(j);
-    j->out_complete = res == DD_OK;
     if (j->fsmap && opt->status != DD_STATUS_NONE) {
         wchar_t a[DD_SIZE_EXACT_CHARS];
         dd_format_size_exact(j->st->bytes_unused, false, false, a, DD_SIZE_EXACT_CHARS);

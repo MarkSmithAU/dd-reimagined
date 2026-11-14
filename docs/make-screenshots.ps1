@@ -183,10 +183,13 @@ try {
     #     ahead of what is compressed: the two-tone progress bar.  Random
     #     data compresses slowly (the card's zeros keep up with the read);
     #     level 6's 24 MiB block per thread lets the read get well ahead
-    #     without the first block taking minutes.
-    $noise = New-Vhd 'noise' 512 @()
+    #     without the first block taking minutes.  The encoder takes in a
+    #     block per thread before compressing, so the disk holds three per
+    #     thread: smaller, the read is all done at once on a many-core machine.
+    $noiseMb = [Math]::Max(512, [Environment]::ProcessorCount * 24 * 3)
+    $noise = New-Vhd 'noise' $noiseMb @()
     $vhds += 'noise'
-    & (Join-Path (Split-Path $Gui) 'dd.exe') if=/dev/random "of=\\.\PhysicalDrive$noise" bs=1M count=512 status=none
+    & (Join-Path (Split-Path $Gui) 'dd.exe') if=/dev/random "of=\\.\PhysicalDrive$noise" bs=1M count=$noiseMb status=none
     if ($LASTEXITCODE -ne 0) { throw 'could not fill the noise disk' }
     $dlg = Open-Gui
     Set-IO $dlg 0 1
