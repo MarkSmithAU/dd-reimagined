@@ -175,6 +175,9 @@ void        dd__hex(const uint8_t d[32], wchar_t out[65]);
 
 /* .xz: also hash the compressed bytes as the file is written or read */
 void dd__xz_set_hash(dd__xz *x, dd__sha256 *raw);
+/* An encoder's writing and finishing give up with ERROR_OPERATION_ABORTED
+   once *stop is nonzero; dd__xz_free then ends its threads within moments. */
+void dd__xz_set_stop(dd__xz *x, const volatile LONG *stop);
 
 /* .hashes files (hash.c) */
 #define DD_MAX_HASHES 8

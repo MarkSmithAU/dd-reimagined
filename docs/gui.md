@@ -43,7 +43,11 @@ the current folder, System32 when running as administrator.
   image's start is decompressed for this).
 - **Sparse read column:** per partition, how much sparse reading would
   read (`Yes: FAT32, reads 1.2 GB`) or why it can't
-  (`No: ext4, not cleanly unmounted`).
+  (`No: ext4, not cleanly unmounted`). A compressed image is mapped in the
+  background once *Only used space* is ticked, as it has to be partly
+  decompressed: the column shows `Mapping: 120 MB decompressed` meanwhile,
+  and the window stays usable. The map is only for the display (Start maps
+  the image again for the copy), and is kept while the image is unchanged.
 - **Summary:** what will be read and written and whether it fits; for a
   wipe, the disk and how much is overwritten.
 
@@ -72,6 +76,14 @@ Writing:
   *Check and write hash files* (image to image).
 - *Verify what is written* (`--verify`), unticked by default: reads the
   output back and compares it.
+- *Delete the image file if stopped or failed*, ticked by default, for
+  image file output; unticked, it is dd.exe's `--keep-incomplete`. If the
+  copy is stopped or fails while writing, the incomplete image file is
+  deleted (a stopped compression would leave an .xz file with no end,
+  which will not decompress fully). The file is kept if the copy never
+  started, so a file that was about to be replaced is still whole, and it
+  is kept if the copy reached the end: with read errors skipped, or only
+  verifying stopped or failed.
 
 Both:
 
@@ -81,9 +93,6 @@ Both:
   20% larger. `.xz` is added to the file name. .xz input is recognised
   from its contents.
 - **Block size:** how much is read and written at a time (default 1 MiB).
-- **Make sparse map:** for image file input, enabled while a compressed
-  image has no usable map. It maps the file systems now, for the *Sparse
-  read* column and summary; *Start* makes the map anyway when needed.
 
 Drive letters of locked volumes are removed during the copy and put back
 afterwards, as dd.exe does by default (see
@@ -128,7 +137,7 @@ The image gets a hash file beside it (`card.img.hashes` for
    verify) is done; if the image replaced them, Windows mounts the new
    ones.
 
-![The finished write: hashes checked, disk verified, letter given to the new volume](images/gui-write-done.png)
+![The finished write: hashes checked, disk verified, the old drive letter kept for its volume](images/gui-write-done.png)
 
 If a disk is plugged in, removed or swapped while the confirmation is
 open, the write is not started; check the disks and press *Start* again.

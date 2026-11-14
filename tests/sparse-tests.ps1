@@ -110,23 +110,6 @@ function Blocks([string]$in, [string]$out, $info, [long]$offset = 0) {
     [pscustomobject]@{ Bad = $r[0]; Zeroed = $r[1]; Kept = $r[2]; Outside = $r[3]; FirstKept = $r[4] }
 }
 
-# A map's "check" line is the SHA-256 of everything above it: an edited map
-# with a new one, as a deliberate edit would have
-function Reseal([string]$t) {
-    $body = $t.Substring(0, $t.LastIndexOf("`ncheck ") + 1)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $h = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($body)) | ForEach-Object { $_.ToString('x2') })
-    $body + "check $h`nend`n"
-}
-
-# A sparse map whose hash no longer matches its image: the first hex digit changed
-function Tamper([string]$map) {
-    $t = [IO.File]::ReadAllText((F $map))
-    $m = [regex]::Match($t, '(?m)^sha256 (.)')
-    $d = if ($m.Groups[1].Value -eq '0') { '1' } else { '0' }
-    [IO.File]::WriteAllText((F $map), (Reseal ($t.Substring(0, $m.Groups[1].Index) + $d + $t.Substring($m.Groups[1].Index + 1))))
-}
-
 function FreeBlocks($info) {
     $n = 0
     foreach ($p in $info.free.Split(',')) { $a, $b = $p.Trim().Split('-'); $n += $(if ($b) { [long]$b - [long]$a + 1 } else { 1 }) }
@@ -349,22 +332,17 @@ try {
     }
     Check 'a read error with iflag=fullblock loses nothing after it' ($r1.Code -eq 1 -and $r2.Code -eq 1 -and (Hash 'fb.out') -eq (Hash 'nb.out')) "$($r1.Err)`n$($r2.Err)"
 
-    # --- compressed images: the sparse map, then reading in order ---------------------------
+    # --- compressed images: mapped first, then read in order ---------------------------
     # (images of 16 MiB at most: compression in tests stays small)
     foreach ($c in @(@('ext4-1k', 1), @('ext4', 9), @('mbr-ext4', 1))) {
         $name = $c[0]; $level = $c[1]
         $r = Run "if=`"$fixtures\$name.img.xz`" of=$name.img bs=1M status=none"
         $r = Run "if=$name.img of=$name.out bs=1M --sparse-read status=none"
         $r = Run "if=$name.img of=z-$name.img.xz bs=1M --xz=$level status=none"
-        $r = Run "if=z-$name.img.xz of=x.out --sparse-read"
-        Check "${name}.xz without a sparse map: refused, saying how to make one" ($r.Code -eq 1 -and $r.Err -match 'needs its file systems mapped first.*--make-sparse-map' -and -not (Test-Path (F 'x.out'))) $r.Err
-        $r = Run "if=z-$name.img.xz --make-sparse-map"
-        $map = if (Test-Path (F "z-$name.img.sparse")) { [IO.File]::ReadAllText((F "z-$name.img.sparse")) } else { '' }
-        Check "${name}.xz (level $level): --make-sparse-map writes z-$name.img.sparse" ($r.Code -eq 0 -and $r.Err -match 'sparse map written to' -and
-            $map -match '^dd sparse map 2' -and $map -match "(?m)^sha256 $((Get-FileHash (F "z-$name.img.xz")).Hash.ToLower())$" -and $map -match "`ncheck [0-9a-f]{64}`nend`n$") "$($r.Err)`n$map"
         $r = Run "if=z-$name.img.xz of=z-$name-out.img.xz bs=1M --sparse-read --xz=1"
-        Check "${name}.xz to .xz, sparse: read in order, the map's hash checked" ($r.Code -eq 0 -and $r.Err -match 'read in order; its free space, from the sparse map' -and
-            $r.Err -match "SHA-256 of z-$name\.img\.xz matches z-$name\.img\.sparse") $r.Err
+        Check "${name}.xz (level $level) to .xz, sparse: mapped first, then read in order" ($r.Code -eq 0 -and
+            $r.Err -match 'mapping the file systems of' -and $r.Err -match 'read in order; its free space is written as zeros') $r.Err
+        Check '... and nothing is left beside the image' (-not (Test-Path (F "z-$name.img.sparse")))
         $r2 = Run "if=z-$name-out.img.xz of=z-$name-out.img bs=1M status=none"
         Check "... gives exactly the sparse read of the uncompressed image" ((Hash "z-$name-out.img") -eq (Hash "$name.out"))
     }
@@ -372,55 +350,38 @@ try {
     $b = Blocks 'mbr-ext4.img' 'z-mbr-ext4-out.img' $info ([long]$info.offset)
     Check 'the compressed MBR image: table, gap and tail identical; the partition''s free space zeroed' ($b.Bad -eq 0 -and $b.Outside -eq 0 -and $b.Kept -eq 0 -and $b.Zeroed -gt (FreeBlocks $info) * 0.9) ($b | Out-String)
     $r = Run "--layout --sparse-read if=z-mbr-ext4.img.xz"
-    Check '--layout --sparse-read answers a compressed image from its map' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s+1\s+1\.0 MiB.*ext4') $r.Out
+    Check '--layout --sparse-read maps a compressed image' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s+1\s+1\.0 MiB.*ext4') $r.Out
+    $r = Run "--layout --sparse-read if=`"$fixtures\ext4.img.xz`""
+    Check '... and the fixture''s .xz too' ($r.Code -eq 0 -and $r.Out -match 'ext4') "$($r.Err)`n$($r.Out)"
     $r = Run "if=z-mbr-ext4.img.xz of=z-fit.img bs=1M --sparse-read --fit status=none"
     Check 'with --fit, from the compressed image' ($r.Code -eq 0 -and [SparseCheck]::Same((F 'z-fit.img'), (F 'mbr-ext4.out'), 15MB)) $r.Err
-    Copy-Item (F 'z-ext4-1k.img.sparse') (F 'z-ext4.img.sparse') -Force
-    $r = Run "if=z-ext4.img.xz of=x.out --sparse-read"
-    Check 'a sparse map of another image is refused (by size)' ($r.Code -eq 1 -and $r.Err -match 'is for another image') $r.Err
-    $r = Run "if=z-ext4.img.xz --make-sparse-map status=none"
-    Tamper 'z-ext4.img.sparse'
-    $r = Run "if=z-ext4.img.xz of=x.out bs=1M --sparse-read"
-    Check 'a sparse map whose hash is not the image''s fails the run' ($r.Code -eq 1 -and $r.Err -match 'does not match z-ext4\.img\.sparse') $r.Err
-    $r = Run "if=z-ext4.img.xz --make-sparse-map status=none"
-    [IO.File]::WriteAllText((F 'z-ext4.img.sparse'), ([IO.File]::ReadAllText((F 'z-ext4.img.sparse')) -replace "end`n$", ''))
-    $r = Run "if=z-ext4.img.xz of=x.out --sparse-read"
-    Check 'a cut-short sparse map is refused' ($r.Code -eq 1 -and $r.Err -match 'it is damaged; make it again') $r.Err
-    # free space that is not the volume's: edited, then edited and resealed
-    $r = Run "if=z-ext4.img.xz --make-sparse-map status=none"
-    $good = [IO.File]::ReadAllText((F 'z-ext4.img.sparse'))
-    $edited = [regex]::Replace($good, '(?m)^free \d+ \d+$', 'free 0 4194304', 1)
-    [IO.File]::WriteAllText((F 'z-ext4.img.sparse'), $edited)
-    $r = Run "if=z-ext4.img.xz of=x.out --sparse-read"
-    Check 'an edited sparse map is refused (its check line)' ($r.Code -eq 1 -and $r.Err -match 'it is damaged; make it again') $r.Err
-    [IO.File]::WriteAllText((F 'z-ext4.img.sparse'), (Reseal $edited))
-    $r = Run "if=z-ext4.img.xz of=x.out --sparse-read"
-    Check '... and resealed: refused, its free space is not what the volume says' ($r.Code -eq 1 -and $r.Err -match 'it is damaged; make it again') $r.Err
-    # with a hash file, the two must agree, and the input's hashes are checked too (all of it is read)
+    # a .sparse file from dd 1.0 is not read
+    [IO.File]::WriteAllText((F 'z-ext4.img.sparse'), "dd sparse map 2`nnot this image`n")
+    $r = Run "if=z-ext4.img.xz of=old.out bs=1M --sparse-read status=none"
+    Check 'an old .sparse file beside the image is ignored' ($r.Code -eq 0 -and (Hash 'old.out') -eq (Hash 'ext4.out')) $r.Err
+    # the image cannot change between being mapped and being read
+    $fs = [IO.File]::Open((F 'z-ext4.img.xz'), 'Open', 'ReadWrite', 'ReadWrite')
+    try {
+        $r = Run "if=z-ext4.img.xz of=x.out --sparse-read"
+    } finally {
+        $fs.Close()
+    }
+    Check 'a compressed image open to write elsewhere is not mapped' ($r.Code -eq 1 -and $r.Err -match 'another program has it open to write') $r.Err
+    # with a hash file, the input's hashes are checked too (all of it is read)
     $r = Run "if=ext4.img of=h.img.xz bs=1M --xz=1 --hashes status=none"
-    $r = Run "if=h.img.xz --make-sparse-map status=none"
     $r = Run "if=h.img.xz of=h.out bs=1M --sparse-read"
     Check 'with a hash file too: both of its hashes are checked, read in order' ($r.Code -eq 0 -and $r.Err -match 'SHA-256 of h\.img\.xz matches h\.img\.hashes' -and
         $r.Err -match 'SHA-256 of h\.img \(uncompressed\) matches') $r.Err
-    Tamper 'h.img.sparse'
-    $r = Run "if=h.img.xz of=disagree.out bs=1M --sparse-read"
-    Check 'a sparse map and hash file that disagree: refused before reading' ($r.Code -eq 1 -and $r.Err -match 'disagree about' -and -not (Test-Path (F 'disagree.out'))) $r.Err
-    # not cleanly unmounted: the map remembers --allow-unclean
+    # not cleanly unmounted
     $r = Run "if=`"$fixtures\ext4-recover.img.xz`" of=rec.img.xz bs=1M --xz=1 status=none"
-    $r = Run "if=rec.img.xz --make-sparse-map --allow-unclean"
-    Check '--make-sparse-map --allow-unclean maps the journal' ($r.Code -eq 0 -and $r.Out -match 'unclean' -and (Get-Content (F 'rec.img.sparse') -Raw) -match '(?m)^unclean 1$') "$($r.Err)`n$($r.Out)"
-    $r = Run "if=rec.img.xz of=x.out --sparse-read"
-    Check '... and is used only with --allow-unclean' ($r.Code -eq 1 -and $r.Err -match 'was made with --allow-unclean') $r.Err
     $r = Run "if=rec.img.xz of=rec-xz.out bs=1M --sparse-read --allow-unclean status=none"
-    Check '... then it gives what reading the uncompressed image does' ($r.Code -eq 0 -and (Hash 'rec-xz.out') -eq (Hash 'rec2.out')) $r.Err
-    $r = Run "if=ext4.img --make-sparse-map"
-    Check '--make-sparse-map of an uncompressed image: not needed, says why' ($r.Code -eq 1 -and $r.Err -match 'not xz-compressed: --sparse-read maps an uncompressed image as it reads it') $r.Err
+    Check 'a compressed image not cleanly unmounted, with --allow-unclean: as reading it uncompressed' ($r.Code -eq 0 -and (Hash 'rec-xz.out') -eq (Hash 'rec2.out')) $r.Err
+    $r = Run "if=rec.img.xz --make-sparse-map"
+    Check '--make-sparse-map is gone' ($r.Code -eq 1 -and $r.Err -match "unrecognized option '--make-sparse-map'") $r.Err
 
     # --- refused ----------------------------------------------------------------------
     $r = Run "if=ext4.img of=x.out --allow-unclean"
     Check '--allow-unclean needs --sparse-read' ($r.Code -eq 1 -and $r.Err -match 'only applies to --sparse-read') $r.Err
-    $r = Run "--layout --sparse-read if=`"$fixtures\ext4.img.xz`""
-    Check '--layout --sparse-read of a compressed image without a map says to make one' ($r.Code -eq 1 -and $r.Err -match 'has no sparse map') $r.Err
     $r = Run "if=/dev/zero of=x.out count=1 --sparse-read"
     Check 'a /dev name is refused' ($r.Code -eq 1 -and $r.Err -match 'needs an image file or a device') $r.Err
     $r = Run "if=ext4.img --verify-hashes --sparse-read"

@@ -328,11 +328,9 @@ try {
     Start-Sleep -Milliseconds 500
     $summary = [W]::Text([W]::GetDlgItem($dlg, $IDC_LAYOUT))
     Check 'writing: an .xz image''s table is shown, and that it is compressed' ($summary -match '^xz-compressed' -and $summary -match 'GPT, 3 partitions') $summary
-    $makeMap = [W]::GetDlgItem($dlg, 1034)                                       # IDC_MAKEMAP
     $col = Column
-    Check 'writing a compressed image: the Sparse read column says Start maps it' ([W]::IsWindowVisible($sparseBox) -and
-        [W]::IsWindowVisible($makeMap) -and [W]::IsWindowEnabled($makeMap) -and
-        @($col | Where-Object { $_ -ne '? Mapped when you start' }).Count -eq 0) ($col -join ' | ')
+    Check 'writing a compressed image: the Sparse read column says Only used space maps it' ([W]::IsWindowVisible($sparseBox) -and
+        @($col | Where-Object { $_ -ne '? Tick Only used space to map it' }).Count -eq 0) ($col -join ' | ')
     $IDC_HASHES = 1021; $IDC_VERIFY = 1022
     $verify = [W]::GetDlgItem($dlg, $IDC_VERIFY)
     Check 'Verify after starts unticked, the hash file check ticked' ([int][W]::SendMessageW($verify, 0xF0, [IntPtr]::Zero, [IntPtr]::Zero) -eq 0 -and
@@ -365,23 +363,12 @@ try {
     [W]::SendMessageW($srcBox, 0x0C, [IntPtr]::Zero, (F 'read.img.xz')) | Out-Null
     Start-Sleep -Milliseconds 500
     $col = Column
-    Check 'copying a compressed image: its table is shown, and it needs a sparse map' ($col.Count -eq $srcParts.Count -and $col[0] -eq '? Mapped when you start' -and
-        [W]::IsWindowEnabled($makeMap)) ($col -join ' | ')
-    [W]::PostMessageW($dlg, 0x111, [IntPtr]1034, [IntPtr]::Zero) | Out-Null           # Make sparse map
-    $done = Wait-For { $x = [W]::Text([W]::GetDlgItem($dlg, $IDC_ETA)); if ($x -match '^(Finished|Failed|Stopped)') { $x } } 60000
-    Start-Sleep -Milliseconds 300
-    $col = Column
-    Check 'Make sparse map maps the compressed image, and is then disabled' ("$done" -like 'Finished. The sparse map is made*' -and (Test-Path (F 'read.img.sparse')) -and
-        $col[0] -match '^Yes: FAT1[26], reads ' -and -not [W]::IsWindowEnabled($makeMap)) "$done | $($col -join ' | ')`n$([W]::Text([W]::GetDlgItem($dlg, $IDC_LOG)))"
-    # another image, with no map yet: the button comes back
-    Copy-Item (F 'read.img.xz') (F 'auto.img.xz')
-    [W]::SendMessageW($srcBox, 0x0C, [IntPtr]::Zero, (F 'auto.img.xz')) | Out-Null
-    Start-Sleep -Milliseconds 300
-    $on = [W]::IsWindowEnabled($makeMap)
-    [W]::SendMessageW($srcBox, 0x0C, [IntPtr]::Zero, (F 'read.img.xz')) | Out-Null
-    Start-Sleep -Milliseconds 300
-    Check 'Make sparse map: offered again for an image without a map, not for one with' ($on -and -not [W]::IsWindowEnabled($makeMap))
-    [W]::SendMessageW($sparseBox, 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null      # tick
+    Check 'copying a compressed image: its table is shown, mapped only with Only used space' ($col.Count -eq $srcParts.Count -and
+        $col[0] -eq '? Tick Only used space to map it') ($col -join ' | ')
+    [W]::SendMessageW($sparseBox, 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null      # tick: maps in the background
+    $col = Wait-For { $c = Column; if ($c[0] -match '^Yes: ') { $c } } 60000
+    Check 'ticking Only used space maps the compressed image in the background, storing nothing' ($col -and $col[0] -match '^Yes: FAT1[26], reads ' -and
+        -not (Test-Path (F 'read.img.sparse')) -and [W]::IsWindowEnabled([W]::GetDlgItem($dlg, $IDC_START))) "$($col -join ' | ')`n$([W]::Text([W]::GetDlgItem($dlg, $IDC_LAYOUT)))"
     $xzBox1 = [W]::GetDlgItem($dlg, $IDC_XZ)
     [W]::SendMessageW($xzBox1, 0x14E, [IntPtr]2, [IntPtr]::Zero) | Out-Null           # xz level 1
     [W]::SendMessageW($dlg, 0x111, [IntPtr](($IDC_XZ) -bor (1 -shl 16)), $xzBox1) | Out-Null
@@ -392,8 +379,9 @@ try {
         "dd if=$(F 'read.img.xz') of=$(F 'copy.img.xz') bs=1M --fit --filter=file --sparse-read --hashes --progress --xz=1") $copyLine
     $done = Run-Copy $dlg
     $log = [W]::Text([W]::GetDlgItem($dlg, $IDC_LOG))
-    Check 'compressed to compressed, sparse: read in order, the map and hash file checked' ("$done" -like 'Finished*' -and
-        $log -match 'its free space, from the sparse map' -and $log -match 'SHA-256 of read\.img\.xz matches') "$done`n$log"
+    Check 'compressed to compressed, sparse: mapped, read in order, the hash file checked' ("$done" -like 'Finished*' -and
+        $log -match 'mapping the file systems of' -and $log -match 'read in order; its free space is written as zeros' -and
+        $log -match 'SHA-256 of read\.img\.xz matches') "$done`n$log"
     & $DD "if=$(F 'copy.img.xz')" "of=$(F 'copy.img')" status=none
     & $DD "if=$(F 'read-unxz.img')" "of=$(F 'copy-ref.img')" --sparse-read status=none
     Check '... giving exactly a sparse read of the uncompressed image' ((Get-FileHash (F 'copy.img')).Hash -eq (Get-FileHash (F 'copy-ref.img')).Hash)
@@ -401,16 +389,19 @@ try {
     cmd /c "$run 2>nul"
     & $DD "if=$(F 'copy-cmd.img.xz')" "of=$(F 'copy-cmd.img')" status=none
     Check '... as its command line does' ((Get-FileHash (F 'copy-cmd.img')).Hash -eq (Get-FileHash (F 'copy.img')).Hash) $run
-    # Start maps an image that has no map, then copies it
+    # Start straight away, while the new image is still being mapped in the
+    # background: that stops, and the copy maps it for itself
+    Copy-Item (F 'read.img.xz') (F 'auto.img.xz')
     [W]::SendMessageW($srcBox, 0x0C, [IntPtr]::Zero, (F 'auto.img.xz')) | Out-Null
     [W]::SendMessageW([W]::GetDlgItem($dlg, $IDC_FILE), 0x0C, [IntPtr]::Zero, (F 'auto-copy.img')) | Out-Null
-    Start-Sleep -Milliseconds 300
     $done = Run-Copy $dlg
     $log = [W]::Text([W]::GetDlgItem($dlg, $IDC_LOG))
     & $DD "if=$(F 'auto-copy.img.xz')" "of=$(F 'auto-copy.img')" status=none
-    Check 'Start makes a missing sparse map, then copies' ("$done" -like 'Finished*' -and (Test-Path (F 'auto.img.sparse')) -and
-        $log -match 'Making the sparse map of' -and $log -match 'now the copy' -and
-        (Get-FileHash (F 'auto-copy.img')).Hash -eq (Get-FileHash (F 'copy.img')).Hash -and -not [W]::IsWindowEnabled($makeMap)) "$done`n$log"
+    Check 'Start during mapping in the background: the copy maps the image itself' ("$done" -like 'Finished*' -and
+        $log -match 'mapping the file systems of' -and -not (Test-Path (F 'auto.img.sparse')) -and
+        (Get-FileHash (F 'auto-copy.img')).Hash -eq (Get-FileHash (F 'copy.img')).Hash) "$done`n$log"
+    $col = Wait-For { $c = Column; if ($c[0] -match '^Yes: ') { $c } } 60000
+    Check '... and after it, the column is mapped again' ($col -and $col[0] -match '^Yes: FAT1[26], reads ') ($col -join ' | ')
     [W]::SendMessageW($sparseBox, 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null      # untick
 
     # --- copying a disk to a disk -----------------------------------------------------

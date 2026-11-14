@@ -26,6 +26,8 @@
 #define WM_APP_MESSAGE  (WM_APP + 1)   /* wParam dd_msg_kind, lParam wchar_t* to free */
 #define WM_APP_PROGRESS (WM_APP + 2)   /* lParam dd_stats* to free */
 #define WM_APP_DONE     (WM_APP + 3)   /* wParam dd_result, lParam dd_stats* to free */
+#define WM_APP_MAPPROG  (WM_APP + 4)   /* wParam map_job*, lParam bytes decompressed */
+#define WM_APP_MAPPED   (WM_APP + 5)   /* lParam map_job* to free */
 #define TIMER_REFRESH   1
 #define PATH_CHARS      1024
 #define IDM_ABOUT       0x0010         /* in the system menu: below 0xF000, low 4 bits clear */
@@ -44,8 +46,26 @@ typedef enum dst { DST_DISK, DST_FILE, DST_NULL } dst;
    disk, and disk to nothing (a read test). */
 typedef enum op { OP_WRITE, OP_READ, OP_CHECK, OP_IMAGES, OP_DISKS, OP_WIPE, OP_TEST } op;
 
-/* What the worker thread does */
-typedef enum task { TASK_COPY, TASK_MAP } task;
+/* Which compressed image a map is of: it is mapped again if any of this
+   changes. */
+typedef struct map_key {
+    wchar_t  file[PATH_CHARS];
+    int64_t  size;
+    FILETIME written;
+    bool     unclean;
+} map_key;
+
+/* Mapping a compressed image in the background, for the Sparse read column
+   and summary only (a copy maps it again for itself).  The thread owns it
+   until it posts WM_APP_MAPPED; the window frees it then. */
+typedef struct map_job {
+    map_key      key;
+    dd_cancel    cancel;
+    dd_stats     st;
+    bool         ok;
+    wchar_t      err[512];
+    dd_fs_report rep;
+} map_job;
 
 typedef struct app {
     HWND           dlg;
@@ -62,9 +82,6 @@ typedef struct app {
     wchar_t        target[512];
     wchar_t        disk_name[32];             /* \\.\PhysicalDriveN, for messages */
     wchar_t        src_name[32];              /* the same, of the disk read when copying disks */
-    task           task;
-    bool           map_unclean;               /* TASK_MAP: with --allow-unclean */
-    wchar_t        map_input[PATH_CHARS];     /* TASK_MAP: the image mapped */
     bool           confirming;                /* a confirmation box is open */
     bool           refresh_pending;           /* a device change arrived meanwhile */
     int            bar_ahead;                 /* the progress bar is pale up to here (of 1000) */
@@ -73,6 +90,15 @@ typedef struct app {
     wchar_t        layout_err[512];
     dd_fs_report  *fs;                        /* reading: what sparse reading would read */
     bool           fs_ok;
+    map_job       *mapping;                   /* mapping the compressed source, or NULL */
+    int64_t        map_done;                  /*   bytes it has decompressed */
+    bool           map_failed;                /* the source could not be mapped: */
+    wchar_t        map_err[512];              /*   why */
+    bool           cache_ok;                  /* the last map made (or failed): */
+    map_key        cache_key;
+    bool           cache_mapped;
+    wchar_t        cache_err[512];
+    dd_fs_report  *cache;
     bool           running;
     bool           writing;
     bool           checking;                  /* only checking an image's hashes */
@@ -375,7 +401,7 @@ static bool reads_partly(void)
     return m != OP_CHECK && m != OP_WIPE;
 }
 
-/* The image read is compressed: sparse reading needs its sparse map. */
+/* The image read is compressed: sparse reading maps it by decompressing. */
 static bool source_compressed(void)
 {
     return source_is_file() && reads_partly() && g.layout_ok && g.layout.compressed;
@@ -403,11 +429,10 @@ static void update_controls(void)
     EnableWindow(GetDlgItem(g.dlg, IDC_FIT), idle && reads_partly() && g.layout_ok && g.layout.scheme != DD_SCHEME_NONE);
     EnableWindow(GetDlgItem(g.dlg, IDC_HASHES), idle && (m == OP_WRITE || m == OP_READ || m == OP_IMAGES || m == OP_CHECK));
     EnableWindow(GetDlgItem(g.dlg, IDC_VERIFY), idle && (target_is_disk() || target_is_file()));
+    EnableWindow(GetDlgItem(g.dlg, IDC_DELPARTIAL), idle && target_is_file());
     EnableWindow(GetDlgItem(g.dlg, IDC_SPARSE), idle && reads_partly());
     EnableWindow(GetDlgItem(g.dlg, IDC_UNCLEAN), idle && reads_partly() &&
                  IsDlgButtonChecked(g.dlg, IDC_SPARSE) == BST_CHECKED);
-    /* g.fs_ok: the image has a map, for it and for Allow unclean as ticked */
-    EnableWindow(GetDlgItem(g.dlg, IDC_MAKEMAP), idle && source_compressed() && !g.fs_ok);
     switch (input_kind()) {
     case SRC_DISK: ready = disk_in(IDC_DISK) != NULL; break;
     case SRC_FILE: ready = has_text(IDC_SRCFILE); break;
@@ -571,7 +596,6 @@ static void set_rows(void)
     show(IDC_HASHES, hashes[m][0] != 0);
     show(IDC_SPARSE, reads_partly());
     show(IDC_UNCLEAN, reads_partly());
-    show(IDC_MAKEMAP, s == SRC_FILE && reads_partly());
 }
 
 /* ---- sparse reading --------------------------------------------------------- */
@@ -615,7 +639,17 @@ static void sparse_cell(const dd_partition *p, wchar_t *buf, size_t n)
         return;
     }
     if (!g.fs_ok) {
-        wcscpy_s(buf, n, g.layout_ok && g.layout.compressed ? L"? Mapped when you start" : L"");
+        buf[0] = 0;
+        if (!g.layout_ok || !g.layout.compressed) {
+            return;
+        } else if (g.mapping) {
+            dd_format_size(g.map_done, false, used, 32);
+            _snwprintf_s(buf, n, _TRUNCATE, L"Mapping: %ls decompressed", used);
+        } else if (g.map_failed) {
+            wcscpy_s(buf, n, L"? Could not be mapped");
+        } else {
+            wcscpy_s(buf, n, sparse_ticked() ? L"? Mapped when you start" : L"? Tick Only used space to map it");
+        }
         return;
     }
     if (!v) {
@@ -633,12 +667,115 @@ static void sparse_cell(const dd_partition *p, wchar_t *buf, size_t n)
         wcscpy_s(buf, n, v->size > 0 ? L"No: not FAT, exFAT, NTFS, ext or swap" : L"No: outside the disk");
 }
 
-/* Reading: what sparse reading would make of the selected disk. */
+/* ---- mapping a compressed source in the background ------------------------- */
+
+/* Stops the background mapping, if any.  Its thread ends soon after; what
+   it posts then is discarded. */
+static void cancel_mapping(void)
+{
+    if (g.mapping) {
+        dd_cancel_request(&g.mapping->cancel);
+        g.mapping = NULL;
+    }
+}
+
+static bool get_map_key(const wchar_t *file, bool unclean, map_key *k)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+
+    memset(k, 0, sizeof *k);
+    if (!GetFileAttributesExW(file, GetFileExInfoStandard, &a))
+        return false;
+    wcscpy_s(k->file, PATH_CHARS, file);
+    k->size = (int64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+    k->written = a.ftLastWriteTime;
+    k->unclean = unclean;
+    return true;
+}
+
+static bool same_map_key(const map_key *a, const map_key *b)
+{
+    return _wcsicmp(a->file, b->file) == 0 && a->size == b->size && a->unclean == b->unclean &&
+           CompareFileTime(&a->written, &b->written) == 0;
+}
+
+static void map_progress(void *ctx, const dd_stats *s)
+{
+    PostMessageW(g.dlg, WM_APP_MAPPROG, (WPARAM)ctx, (LPARAM)s->phase_done);
+}
+
+static DWORD WINAPI map_thread(void *arg)
+{
+    map_job *mj = arg;
+    dd_callbacks cb;
+
+    memset(&cb, 0, sizeof cb);
+    cb.progress = map_progress;
+    cb.ctx = mj;
+    cb.progress_interval_ms = 250;
+    mj->ok = dd_fs_report_read(mj->key.file, mj->key.unclean, &cb, &mj->cancel, &mj->st, &mj->rep, mj->err, 512);
+    if (!PostMessageW(g.dlg, WM_APP_MAPPED, 0, (LPARAM)mj))
+        free(mj);           /* the window is gone */
+    return 0;
+}
+
+/* A compressed image: with Only used space ticked, it is mapped in the
+   background, decompressing the parts its file systems need.  The last map
+   is kept while its file, size, time written and Allow unclean stay the
+   same.  Not during a copy, which maps it for itself. */
+static void map_compressed(const wchar_t *file)
+{
+    map_key k;
+    map_job *mj;
+    HANDLE t;
+
+    g.map_failed = false;
+    if (!sparse_ticked() || !get_map_key(file, unclean_ticked(), &k)) {
+        cancel_mapping();
+        return;
+    }
+    if (g.cache_ok && same_map_key(&g.cache_key, &k)) {
+        cancel_mapping();
+        if (g.cache_mapped) {
+            *g.fs = *g.cache;
+            g.fs_ok = true;
+        } else {
+            g.map_failed = true;
+            wcscpy_s(g.map_err, 512, g.cache_err);
+        }
+        return;
+    }
+    if (g.mapping && same_map_key(&g.mapping->key, &k))
+        return;             /* already under way */
+    cancel_mapping();
+    if (g.running || !g.cache || (mj = calloc(1, sizeof *mj)) == NULL)
+        return;
+    mj->key = k;
+    dd_cancel_init(&mj->cancel);
+    t = CreateThread(NULL, 0, map_thread, mj, 0, NULL);
+    if (!t) {
+        free(mj);
+        return;
+    }
+    CloseHandle(t);
+    g.mapping = mj;
+    g.map_done = 0;
+}
+
+/* Reading: what sparse reading would make of the selected disk or image. */
 static void load_fs(const wchar_t *disk)
 {
     wchar_t err[512];
 
-    g.fs_ok = g.fs && disk && dd_fs_report_read(disk, unclean_ticked(), g.fs, err, 512);
+    g.fs_ok = false;
+    if (!g.fs || !disk)
+        return;
+    if (source_is_file() && g.layout.compressed) {
+        map_compressed(disk);
+        return;
+    }
+    cancel_mapping();
+    g.fs_ok = dd_fs_report_read(disk, unclean_ticked(), NULL, NULL, NULL, g.fs, err, 512);
 }
 
 /* "disk.img.hashes", or a note that there is none */
@@ -749,9 +886,19 @@ static void sparse_summary(wchar_t *text, size_t n)
     if (!sparse_ticked())
         return;
     if (!g.fs_ok) {
-        if (g.layout_ok && g.layout.compressed)
+        if (!g.layout_ok || !g.layout.compressed)
+            return;
+        if (g.mapping) {
+            dd_format_size(g.map_done, false, size, DD_SIZE_EXACT_CHARS);
+            _snwprintf_s(text + wcslen(text), n - wcslen(text), _TRUNCATE,
+                         L"\nMapping its file systems, to show what is kept: %ls decompressed so far.", size);
+        } else if (g.map_failed) {
+            _snwprintf_s(text + wcslen(text), n - wcslen(text), _TRUNCATE,
+                         L"\nIts file systems could not be mapped: %ls", g.map_err);
+        } else {
             wcsncat_s(text, n, L"\nThe image is compressed, so it is read in order: Start maps its file systems"
-                               L" first, or Make sparse map does now.", _TRUNCATE);
+                               L" first.", _TRUNCATE);
+        }
         return;
     }
     {
@@ -940,6 +1087,8 @@ static void load_layout(void)
     }
     if (g.layout_ok && m != OP_CHECK)
         load_fs(file);
+    else
+        cancel_mapping();
     for (i = 0; g.layout_ok && i < g.layout.count; i++) {
         const dd_partition *p = &g.layout.parts[i];
         wchar_t num[16], start[DD_SIZE_EXACT_CHARS], size[DD_SIZE_EXACT_CHARS], type[64], sparse[128];
@@ -964,6 +1113,44 @@ static void load_layout(void)
     }
     show_fit();
     update_controls();
+}
+
+/* Mapping in the background moved on: the Sparse read column and summary
+   again, without reading the partition table again. */
+static void refresh_sparse(void)
+{
+    HWND lv = GetDlgItem(g.dlg, IDC_PARTS);
+    wchar_t sparse[128];
+    LVITEMW it;
+    size_t i;
+
+    if (!g.layout_ok || operation() == OP_CHECK)
+        return;
+    for (i = 0; i < g.layout.count; i++) {
+        sparse_cell(&g.layout.parts[i], sparse, 128);
+        memset(&it, 0, sizeof it);
+        it.iSubItem = 5;
+        it.pszText = sparse;
+        SendMessageW(lv, LVM_SETITEMTEXTW, (WPARAM)i, (LPARAM)&it);
+    }
+    show_fit();
+}
+
+/* The background mapping ended: kept for as long as the image stays the
+   same, then shown if it is still the source. */
+static void map_ended(map_job *mj)
+{
+    if (mj == g.mapping) {
+        g.mapping = NULL;
+        g.cache_ok = true;
+        g.cache_key = mj->key;
+        g.cache_mapped = mj->ok;
+        wcscpy_s(g.cache_err, 512, mj->err);
+        if (mj->ok)
+            *g.cache = mj->rep;
+        load_layout();
+    }
+    free(mj);
 }
 
 static void init_partition_list(void)
@@ -1022,8 +1209,7 @@ static DWORD WINAPI worker(void *arg)
     cb.message = cb_message;
     cb.progress = cb_progress;
     cb.progress_interval_ms = 250;
-    r = g.task == TASK_MAP ? dd_make_sparse_map(g.map_input, g.map_unclean, &cb, &g.cancel, st, NULL)
-                           : dd_run(&g.opt, &cb, &g.cancel, st);
+    r = dd_run(&g.opt, &cb, &g.cancel, st);
     PostMessageW(g.dlg, WM_APP_DONE, (WPARAM)r, (LPARAM)st);
     return 0;
 }
@@ -1181,18 +1367,23 @@ static void set_bar(int done, int ahead)
     InvalidateRect(bar, NULL, FALSE);   /* SETPOS repaints only when done moves */
 }
 
-/* Verifying the copy, checking an image's hashes, or making a sparse map */
+/* Verifying the copy, checking an image's hashes, or mapping a compressed
+   image before copying it */
 static void show_phase(const dd_stats *s)
 {
     const wchar_t *what = s->phase == DD_PHASE_VERIFY ? L"Verifying"
-                        : s->phase == DD_PHASE_MAP ? (s->phase_total > 0 ? L"Hashing" : L"Mapping")
+                        : s->phase == DD_PHASE_MAP ? L"Mapping"
                         : L"Checking";
-    wchar_t line[256], eta[256], left[64], title[96], done[DD_SIZE_EXACT_CHARS];
+    wchar_t line[256], eta[256], left[64], title[96], done[DD_SIZE_EXACT_CHARS], speed[32];
     int percent = -1;
 
     dd_format_size_exact(s->phase_done, true, true, done, DD_SIZE_EXACT_CHARS);
-    _snwprintf_s(line, 256, _TRUNCATE, L"%ls: %ls %ls", what, done,
-                 s->phase == DD_PHASE_MAP && s->phase_total <= 0 ? L"decompressed" : L"read");
+    if (s->phase_elapsed > 0)
+        dd_format_size((int64_t)(s->phase_done / s->phase_elapsed), true, speed, 32);
+    else
+        wcscpy_s(speed, 32, L"0 B");
+    _snwprintf_s(line, 256, _TRUNCATE, L"%ls: %ls %ls, %ls/s", what, done,
+                 s->phase == DD_PHASE_MAP ? L"decompressed" : L"read", speed);
     SetDlgItemTextW(g.dlg, IDC_STATUS, line);
     eta[0] = 0;
     if (s->phase_total > 0) {
@@ -1268,6 +1459,8 @@ static int confirm(const wchar_t *text, const wchar_t *title)
 
 static void run_worker(void)
 {
+    cancel_mapping();       /* the copy maps for itself, if it needs to */
+    refresh_sparse();
     SendDlgItemMessageW(g.dlg, IDC_PROGRESS, PBM_SETSTATE, PBST_NORMAL, 0);
     set_bar(0, 0);
     SetDlgItemTextW(g.dlg, IDC_STATUS, L"Starting...");
@@ -1318,6 +1511,7 @@ static void options_from_controls(dd_options *o, const dd_disk_info *target)
     } else if (target_is_file()) {
         o->xz_level = xz_level();
         o->filter = DD_FILTER_FILE;
+        o->keep_incomplete = !ticked(IDC_DELPARTIAL);
     }
     if (source_is_disk())
         o->lock_input = ticked(IDC_LOCKIN);
@@ -1383,7 +1577,7 @@ static void format_command(const dd_options *o, const wchar_t *in, const wchar_t
                      o->iflags & DD_FLAG_COUNT_BYTES ? L" iflag=count_bytes" : L"");
     }
     len = wcslen(buf);
-    _snwprintf_s(buf + len, n - len, _TRUNCATE, L"%ls%ls%ls%ls%ls%ls%ls%ls%ls%ls%ls",
+    _snwprintf_s(buf + len, n - len, _TRUNCATE, L"%ls%ls%ls%ls%ls%ls%ls%ls%ls%ls%ls%ls",
                  o->check_hashes ? L" --verify-hashes" : L"",
                  o->fit ? L" --fit" : L"",
                  o->filter != DD_FILTER_NONE ? L" --filter=" : L"",
@@ -1394,6 +1588,7 @@ static void format_command(const dd_options *o, const wchar_t *in, const wchar_t
                  o->sparse_unclean ? L" --allow-unclean" : L"",
                  o->hashes == DD_HASHES_ON ? L" --hashes" : o->hashes == DD_HASHES_OFF ? L" --no-hashes" : L"",
                  o->verify ? L" --verify" : L"",
+                 o->keep_incomplete ? L" --keep-incomplete" : L"",
                  L" --progress");
     if (o->xz_level >= 0) {
         len = wcslen(buf);
@@ -1486,14 +1681,6 @@ static bool usable_disk(const dd_disk_info *d)
     return true;
 }
 
-/* A compressed image is read in order: reading only its used space needs
-   its sparse map, which Start makes first when there is none (or none it
-   can use).  g.layout and g.fs_ok must be the image's. */
-static bool map_needed(void)
-{
-    return sparse_ticked() && g.layout_ok && g.layout.compressed && !g.fs_ok;
-}
-
 /* Asks before a disk is overwritten with what (size bytes, described by
    size_text), refusing if --fit's partitions cannot fit.  g.layout is the
    source's. */
@@ -1528,16 +1715,7 @@ static bool confirm_disk_write(const dd_disk_info *disk, const wchar_t *what, in
     return confirm(msg, L"Overwrite disk") == IDYES;
 }
 
-/* A copy waiting for its source's sparse map: what Start confirmed. */
-static struct {
-    bool         on;
-    bool         mapped;        /* the copy running followed its map */
-    op           m;
-    dd_disk_info disk, from;
-    media_id     disk_id, from_id;
-} chained;
-
-/* After a wait (a confirmation, or making the map): the disks must still
+/* After a wait (a confirmation): the disks must still
    hold what they held when the copy was set up.  When says what the wait
    was, for the message. */
 static bool disks_unchanged(op m, const dd_disk_info *disk, const media_id *disk_id,
@@ -1560,41 +1738,6 @@ static bool disks_unchanged(op m, const dd_disk_info *disk, const media_id *disk
     return true;
 }
 
-/* Maps a compressed image's file systems on the worker thread, so that it
-   can be read sparsely. */
-static void run_map(const wchar_t *file)
-{
-    wchar_t map[PATH_CHARS + 16];
-
-    if (!dd_sparse_map_name(file, map, sizeof map / sizeof *map))
-        map[0] = 0;
-    wcscpy_s(g.map_input, PATH_CHARS, file);
-    g.map_unclean = unclean_ticked();
-    log_line(L"Making the sparse map of %ls%ls, in %ls", file,
-             g.map_unclean ? L", including file systems not cleanly unmounted" : L"", map);
-    g.task = TASK_MAP;
-    run_worker();
-}
-
-/* Make sparse map: only the map, to see what sparse reading would read. */
-static void start_make_map(void)
-{
-    wchar_t file[PATH_CHARS];
-
-    if (g.running || g.confirming || !source_compressed())
-        return;
-    GetDlgItemTextW(g.dlg, IDC_SRCFILE, file, PATH_CHARS);
-    if (!file[0] || !need_full_path(file))
-        return;
-    chained.on = false;
-    SetDlgItemTextW(g.dlg, IDC_LOG, L"");
-    g.opt.verify = false;
-    g.writing = false;
-    g.checking = false;
-    g.removable = false;
-    run_map(file);
-}
-
 static void start(void)
 {
     const dd_disk_info *sel = source_disk(), *sel2 = target_disk();
@@ -1613,7 +1756,6 @@ static void start(void)
     memset(&from_id, 0, sizeof from_id);
     what[0] = 0;
     GetDlgItemTextW(g.dlg, IDC_SRCFILE, src, PATH_CHARS);
-    g.task = TASK_COPY;
     g.testing = false;
     if (checking_hashes()) {
         start_check(src);
@@ -1834,17 +1976,6 @@ static void start(void)
     if (!disks_unchanged(m, &disk, &disk_id, &from, &from_id, L"while the confirmation was open"))
         return;
     g.checking = false;
-    if (map_needed()) {
-        /* the copy follows the map, without asking again */
-        chained.on = true;
-        chained.m = m;
-        chained.disk = disk;
-        chained.from = from;
-        chained.disk_id = disk_id;
-        chained.from_id = from_id;
-        run_map(g.input);
-        return;
-    }
     run_worker();
     return;
 
@@ -1856,32 +1987,14 @@ declined:
 static void finished(dd_result r, dd_stats *st)
 {
     wchar_t buf[512];
-    bool mapped = g.task == TASK_MAP;
+    bool deleted = st && st->output_deleted;     /* the engine did, keep_incomplete being off */
 
     WaitForSingleObject(g.worker, INFINITE);
     CloseHandle(g.worker);
     g.worker = NULL;
     g.running = false;
 
-    if (mapped && chained.on) {
-        chained.on = false;
-        if (r == DD_OK && !g.close_when_done) {
-            free(st);
-            g.task = TASK_COPY;
-            if (disks_unchanged(chained.m, &chained.disk, &chained.disk_id, &chained.from, &chained.from_id,
-                                L"while the sparse map was made")) {
-                log_line(L"The sparse map is made; now the copy.");
-                chained.mapped = true;
-                run_worker();
-                return;
-            }
-            SetDlgItemTextW(g.dlg, IDC_ETA, L"Not started. The sparse map is made.");
-            load_layout();
-            return;
-        }
-    }
-
-    if (st && st->started && (g.checking || mapped)) {
+    if (st && st->started && g.checking) {
         show_phase(st);
     } else if (st && st->started) {
         dd_stats copy = *st;            /* the copy's line, even after verifying */
@@ -1899,8 +2012,7 @@ static void finished(dd_result r, dd_stats *st)
     case DD_OK:
         set_bar(1000, 0);
         SetDlgItemTextW(g.dlg, IDC_ETA,
-                        mapped ? L"Finished. The sparse map is made."
-                        : g.checking ? L"Finished. The image matches its hash file."
+                        g.checking ? L"Finished. The image matches its hash file."
                         : g.testing ? L"Finished. All of it was read without error."
                         : g.writing && g.removable && g.verified
                         ? L"Finished. The disk has been written, verified and flushed; you can remove it."
@@ -1911,10 +2023,11 @@ static void finished(dd_result r, dd_stats *st)
         break;
     case DD_CANCELLED:
         SendDlgItemMessageW(g.dlg, IDC_PROGRESS, PBM_SETSTATE, PBST_PAUSED, 0);
-        SetDlgItemTextW(g.dlg, IDC_ETA, mapped ? L"Stopped. No sparse map was written."
+        SetDlgItemTextW(g.dlg, IDC_ETA, !st || !st->started ? L"Stopped before the copy began."
                         : g.checking ? L"Stopped. The image was not fully checked."
                         : g.testing ? L"Stopped. Not all of it was read."
                         : g.writing ? L"Stopped. The disk is only partly written, or not verified."
+                        : deleted ? L"Stopped. The incomplete image file was deleted."
                         : L"Stopped. The image file is incomplete, or not verified.");
         break;
     default:
@@ -1924,7 +2037,6 @@ static void finished(dd_result r, dd_stats *st)
         break;
     }
     free(st);
-    g.task = TASK_COPY;
 
     if (g.close_when_done) {
         EndDialog(g.dlg, 0);
@@ -1932,9 +2044,8 @@ static void finished(dd_result r, dd_stats *st)
     }
     if (g.writing || g.refresh_pending)
         fill_disks();       /* the partition table has probably changed */
-    else if (mapped || chained.mapped)
-        load_layout();      /* the Sparse read column comes from the new map */
-    chained.mapped = false;
+    else if (source_compressed())
+        load_layout();      /* Start stopped any mapping in the background */
     update_controls();
 }
 
@@ -2064,7 +2175,9 @@ static void init_dialog(HWND dlg)
     SendDlgItemMessageW(dlg, IDC_FILE, EM_SETCUEBANNER, TRUE, (LPARAM)L"Choose the image file to write");
     SendDlgItemMessageW(dlg, IDC_SRCFILE, EM_SETCUEBANNER, TRUE, (LPARAM)L"Choose or drop the image file to read");
     CheckDlgButton(dlg, IDC_HASHES, BST_CHECKED);   /* Verify after starts unticked */
+    CheckDlgButton(dlg, IDC_DELPARTIAL, BST_CHECKED);
     g.fs = malloc(sizeof *g.fs);    /* without it, the Sparse read column stays empty */
+    g.cache = malloc(sizeof *g.cache);  /* without it, compressed images are not mapped early */
     set_rows();             /* Raw starts unticked: only the partitions are copied */
     init_xz_list();
     init_partition_list();
@@ -2163,9 +2276,6 @@ static INT_PTR CALLBACK dialog_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BROWSE_SRC:
             browse(IDC_SRCFILE);
             return TRUE;
-        case IDC_MAKEMAP:
-            start_make_map();
-            return TRUE;
         case IDC_START:
             start();
             return TRUE;
@@ -2242,7 +2352,19 @@ static INT_PTR CALLBACK dialog_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         finished((dd_result)wp, (dd_stats *)lp);
         return TRUE;
 
+    case WM_APP_MAPPROG:
+        if ((map_job *)wp == g.mapping) {
+            g.map_done = (int64_t)lp;
+            refresh_sparse();
+        }
+        return TRUE;
+
+    case WM_APP_MAPPED:
+        map_ended((map_job *)lp);
+        return TRUE;
+
     case WM_DESTROY:
+        cancel_mapping();
         if (g.disk_notify)
             UnregisterDeviceNotification(g.disk_notify);
         dd_free_device_list(&g.devices);

@@ -117,18 +117,20 @@ if=IMAGE` shows how much of each file system would be read.
 - **Hash files.** An uncompressed input's hash file is not checked, as free
   space reads as zeros; a compressed input is read whole, so it is.
 - **Compressed images** can only be read in order, but mapping needs
-  metadata from anywhere, so map them first: `dd if=disk.img.xz
-  --make-sparse-map` (or dd-gui.exe's *Make sparse map*) decompresses only
-  the parts needed and writes `disk.img.sparse` beside the image.
-  `dd if=disk.img.xz of=new.img.xz --sparse-read` then reads it in order,
-  writing free space as zeros, as for the uncompressed image.
+  metadata from anywhere. So `dd if=disk.img.xz of=new.img.xz
+  --sparse-read` maps the image first, decompressing only the parts its
+  file systems need, then reads it in order, writing free space as zeros,
+  as for the uncompressed image.
+  - The map is made for each run and kept in memory only, so it is always
+    the image's. From mapping to the end of the copy, the .xz file is
+    held so that nothing can write to it; if another program has it open
+    to write, it is not mapped.
   - Mapping decompresses from the start of each .xz block it needs. dd's
     .xz files have many blocks; one from `xz` without threads is a single
     block, slower to map.
-  - The map is bound to the .xz file by its SHA-256, checked during the
-    read (and against the image's hash file beforehand). A map made with
-    `--allow-unclean` is only used with it.
-  - The .sparse file is text ending in a SHA-256 of itself. A damaged or
-    edited map is refused, as is one whose free ranges differ from what
-    its volumes say is free. A read error while mapping fails the map: in
-    a compressed file it means damage.
+  - A read error while mapping fails the copy: in a compressed file it
+    means damage.
+  - The image must be a file, not standard input, as mapping opens it
+    again to read it out of order.
+  - dd 1.0's `--make-sparse-map` and its `.sparse` files are gone; old
+    `.sparse` files are ignored and can be deleted.

@@ -31,11 +31,22 @@ struct dd__xz {
     int      level;          /* encoder: the preset used */
     uint64_t memusage;       /* encoder: what it needs; decoder: its limit */
     dd__sha256 *raw_hash;    /* hashes the compressed bytes, or NULL */
+    const volatile LONG *stop;   /* encoder: nonzero once cancelled, or NULL */
 };
 
 void dd__xz_set_hash(dd__xz *x, dd__sha256 *raw)
 {
     x->raw_hash = raw;
+}
+
+void dd__xz_set_stop(dd__xz *x, const volatile LONG *stop)
+{
+    x->stop = stop;
+}
+
+static bool stopped(const dd__xz *x)
+{
+    return x->stop && *x->stop;
 }
 
 bool dd__xz_magic(const uint8_t *p, size_t n)
@@ -234,6 +245,10 @@ DWORD dd__xz_write(dd__xz *x, const void *buf, DWORD len)
     x->s.next_in = buf;
     x->s.avail_in = len;
     while (x->s.avail_in > 0) {
+        /* with its input queue full, lzma_code waits (up to mt.timeout at a
+           time) for a thread to finish a block, which can take minutes */
+        if (stopped(x))
+            return ERROR_OPERATION_ABORTED;
         r = lzma_code(&x->s, LZMA_RUN);
         if (r != LZMA_OK)
             return map(r);
@@ -255,6 +270,8 @@ DWORD dd__xz_finish(dd__xz *x, int64_t *compressed, void (*tick)(void *), void *
     x->s.next_in = NULL;
     x->s.avail_in = 0;
     for (;;) {
+        if (stopped(x))
+            return ERROR_OPERATION_ABORTED;
         r = lzma_code(&x->s, LZMA_FINISH);
         if (r != LZMA_OK && r != LZMA_STREAM_END)
             return map(r);

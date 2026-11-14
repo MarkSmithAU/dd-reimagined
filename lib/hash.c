@@ -122,11 +122,6 @@ bool dd_hash_file_name(const wchar_t *image, wchar_t *out, size_t n)
     return side_file_name(image, L".hashes", out, n);
 }
 
-bool dd_sparse_map_name(const wchar_t *image, wchar_t *out, size_t n)
-{
-    return side_file_name(image, L".sparse", out, n);
-}
-
 /* The name the uncompressed image goes by: disk.img for disk.img.xz.  A
    compressed file without the .xz suffix has no such name, so one is made. */
 void dd__uncompressed_name(const wchar_t *name, wchar_t *out, size_t n)

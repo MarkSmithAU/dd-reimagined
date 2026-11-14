@@ -129,6 +129,13 @@ typedef struct dd_options {
                                 unless fit) */
     bool verify;             /* after the copy, read the output back and
                                 check it holds what was written */
+    bool keep_incomplete;    /* keep an output file the copy stopped or
+                                failed in.  By default it is deleted, when
+                                all of it is this run's: a file dd opened,
+                                with no seek, conv=notrunc or oflag=append.
+                                A file whose copy reached the end (read errors
+                                skipped by conv=noerror, verify failing,
+                                say) is kept. */
     bool check_hashes;       /* only read if= (an image file) and check it
                                 against its .hashes file; no output */
     bool sparse_read;        /* read only the space the input's file systems
@@ -137,9 +144,10 @@ typedef struct dd_options {
                                 space is written as zeros without being read.
                                 Partition tables, gaps and anything not
                                 recognised are read as usual.  A compressed
-                                if= needs a sparse map (dd_make_sparse_map);
-                                it is then read in order, and its free space
-                                zeroed as it goes. */
+                                if= (a file) is mapped first, decompressing
+                                the parts its file systems need; it is then
+                                read in order, and its free space zeroed as
+                                it goes. */
     bool sparse_unclean;     /* sparse_read: also map file systems that were
                                 not cleanly unmounted, conservatively (ext3/4:
                                 bitmaps from the journal too; FAT: every FAT
@@ -175,12 +183,16 @@ typedef enum dd_phase {
     DD_PHASE_COPY,           /* the copy itself */
     DD_PHASE_VERIFY,         /* verify: reading the output back */
     DD_PHASE_CHECK,          /* reading the input to check its hashes */
-    DD_PHASE_MAP             /* making a sparse map: decompressing the parts
-                                the file systems need, then hashing the file */
+    DD_PHASE_MAP             /* mapping a compressed image's file systems for
+                                sparse reading: decompressing the parts they
+                                need (phase_total is -1).  Before the copy;
+                                started is still false. */
 } dd_phase;
 
 typedef struct dd_stats {
     bool    started;         /* false if dd_run failed before copying began */
+    bool    output_deleted;  /* the output file was left incomplete, and
+                                deleted (see keep_incomplete) */
     int64_t r_full, r_partial;
     int64_t w_full, w_partial;
     int64_t bytes_read;
@@ -406,24 +418,13 @@ typedef struct dd_fs_report {
 
 /* What --sparse-read would read of an image file or device: its volumes,
    their file systems and used space.  allow_unclean as sparse_unclean.
-   A compressed image is answered from its sparse map, which must exist and
-   match the image's sizes.  False if the input cannot be opened, has no
-   usable sparse map, or memory runs out. */
-bool dd_fs_report_read(const wchar_t *path, bool allow_unclean, dd_fs_report *out, wchar_t *err, size_t errlen);
-
-/* A compressed image is read in order, so sparse reading needs its file
-   systems mapped beforehand: its sparse map, disk.img.sparse for both
-   disk.img and disk.img.xz (as for hash files).  False for devices,
-   standard streams and /dev names. */
-bool dd_sparse_map_name(const wchar_t *image, wchar_t *out, size_t n);
-
-/* Makes the sparse map of a compressed image: decompresses the parts its
-   file systems need (out of order, a block at a time), and hashes the .xz
-   file, to which the map is bound.  Reports progress as DD_PHASE_MAP.
-   allow_unclean as sparse_unclean; a map made with it is only used with
-   it.  rep (may be NULL) receives what the map says. */
-dd_result dd_make_sparse_map(const wchar_t *image, bool allow_unclean, const dd_callbacks *cb,
-                             dd_cancel *cancel, dd_stats *stats, dd_fs_report *rep);
+   Reading metadata only, this is quick, except for a compressed image:
+   that is mapped by decompressing the parts its file systems need, which
+   can take minutes, reported to cb as DD_PHASE_MAP in stats; cancel stops
+   it.  cb, cancel and stats may be NULL.  False, with a message in err,
+   if the input cannot be opened or mapped, or was cancelled. */
+bool dd_fs_report_read(const wchar_t *path, bool allow_unclean, const dd_callbacks *cb, dd_cancel *cancel,
+                       dd_stats *stats, dd_fs_report *out, wchar_t *err, size_t errlen);
 
 #ifdef __cplusplus
 }

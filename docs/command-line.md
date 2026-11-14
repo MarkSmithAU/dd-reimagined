@@ -38,10 +38,9 @@ Compress at level 3; decompress to a sparse file:
     dd if=card.img of=card.img.xz --xz=3
     dd if=card.img.xz of=card-sparse.img conv=sparse
 
-Map a compressed image for sparse reading, then make a smaller copy with
-free space zeroed:
+Make a smaller copy of a compressed image, with free space zeroed (its file
+systems are mapped first, decompressing the parts they need):
 
-    dd if=card.img.xz --make-sparse-map
     dd if=card.img.xz of=small.img.xz --sparse-read
 
 Ordinary GNU dd jobs:
@@ -142,13 +141,13 @@ Partitions, compression, hashes and sparse reading
 | `--fit` | copy only to the end of the last partition, refuse if that does not fit, rebuild a GPT's backup at the end |
 | `--sparse-read` | read only space the file systems use; write free space as zeros |
 | `--allow-unclean` | with `--sparse-read`, also map uncleanly unmounted file systems, conservatively |
-| `--make-sparse-map` | map the file systems of an `.xz` `if=` into `IMAGE.sparse` |
 | `--xz[=LEVEL]` | compress output at level 0-9 (default 9); automatic for `of=*.xz` |
 | `--xz-memory=SIZE` | memory limit for compression and decompression together |
 | `--no-xz` | never compress or decompress |
 | `--hashes` | write a SHA-256 hash file for any new output file |
 | `--no-hashes` | neither write nor check hash files |
 | `--verify` | read the output back and check it matches |
+| `--keep-incomplete` | keep an output file the copy stopped or failed in; by default one that is all this run's (no `seek=`, `conv=notrunc` or `oflag=append`) is deleted |
 | `--verify-hashes` | check image `if=` against its hash file and exit, writing nothing |
 | `--progress` | `status=progress` |
 | `--size` | accepted for dd 0.6 compatibility; device sizes are always honoured |

@@ -13,9 +13,12 @@
     lies inside an ISO 9660 file system (hybrid ISOs keep an EFI image's
     FAT inside an ISO file, so the FAT's free space is file data there).
 
-    A compressed image is read in order, so its map is made beforehand
-    (dd_make_sparse_map) and kept in a .sparse file beside it: the free
-    ranges, the report, and the SHA-256 of the .xz file it belongs to.
+    A compressed image is read in order, but mapping needs metadata from
+    anywhere, so it is mapped first (dd__fsmap_build_xz) through a second
+    decoder that seeks, decompressing only the .xz blocks the file systems
+    need.  The map is kept in memory for that run only, and the file is held
+    against writers from mapping to the end of the copy (dd__fs_hold), so
+    the map is always the image's.
 */
 #include "fs.h"
 #include <stdarg.h>
@@ -28,8 +31,6 @@
 #define WINDOW   (1u << 20)         /* the read cache */
 #define MIN_READ (64u << 10)        /* a small read fetches this much */
 
-#define MAP_MAGIC "dd sparse map 2"
-#define MAX_MAP_FILE (1u << 30)
 
 /* The order matters: the first driver whose probe says yes maps the volume. */
 static const dd__fs_driver *const drivers[] = {
@@ -153,14 +154,12 @@ void dd__fs_note(dd__fs_map *m, const wchar_t *fmt, ...)
 
 /* ---- the map ----------------------------------------------------------- */
 
-/* A file system's place in the input, with its bits; or, in a loaded map,
-   one free range (free_run). */
+/* A file system's place in the input, with its bits */
 typedef struct region {
     int64_t  start, end;
     int64_t  bits_start, bits_end; /* where the bits apply */
     uint32_t unit;
     uint8_t *bits;
-    bool     free_run;             /* all of [start, end) is free */
 } region;
 
 struct dd__fsmap {
@@ -241,10 +240,6 @@ int64_t dd__fsmap_run(const dd__fsmap *fm, int64_t pos, int64_t max, bool *used)
     r = &fm->r[lo];
     if (pos < r->start)
         return r->start - pos < max ? r->start - pos : max;
-    if (r->free_run) {
-        *used = false;
-        return r->end - pos < max ? r->end - pos : max;
-    }
     if (pos < r->bits_start)
         return r->bits_start - pos < max ? r->bits_start - pos : max;
     if (pos >= r->bits_end)
@@ -572,340 +567,9 @@ out:
     return fm;
 }
 
-/* ---- the .sparse file ---------------------------------------------------- */
+/* ---- mapping a compressed image ------------------------------------------ */
 
-typedef struct text {
-    char  *p;
-    size_t len, cap;
-    bool   failed;
-} text;
-
-static void put(text *t, const char *fmt, ...)
-{
-    va_list ap;
-    int n;
-
-    for (;;) {
-        if (t->failed)
-            return;
-        va_start(ap, fmt);
-        n = t->cap > t->len ? vsnprintf(t->p + t->len, t->cap - t->len, fmt, ap) : -1;
-        va_end(ap);
-        if (n >= 0 && (size_t)n < t->cap - t->len) {
-            t->len += (size_t)n;
-            return;
-        }
-        {
-            size_t cap = t->cap ? t->cap * 2 : 1u << 16;
-            char *q = realloc(t->p, cap);
-            if (!q) {
-                t->failed = true;
-                return;
-            }
-            t->p = q;
-            t->cap = cap;
-        }
-    }
-}
-
-static void put_utf8(text *t, const wchar_t *s)
-{
-    char buf[1024];
-    int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, buf, sizeof buf, NULL, NULL);
-    size_t i;
-
-    if (n <= 0)
-        buf[0] = 0;
-    for (i = 0; buf[i]; i++)            /* one line per entry */
-        if (buf[i] == '\n' || buf[i] == '\r')
-            buf[i] = ' ';
-    put(t, "%s", buf);
-}
-
-static DWORD save_map(const wchar_t *path, const dd__fsmap *fm, const dd_fs_report *rep, const dd__map_id *id)
-{
-    wchar_t tmp[1100 + 8], hex[65];     /* path is at most 1100 */
-    text t = { NULL, 0, 0, false };
-    int64_t pos = 0, free_at = -1, free_len = 0;
-    char hexa[65];
-    DWORD e = 0, w;
-    HANDLE h;
-    size_t i;
-
-    dd__hex(id->sha256, hex);
-    for (i = 0; i < 65; i++)
-        hexa[i] = (char)hex[i];
-    put(&t, MAP_MAGIC "\nsha256 %s\nfile_size %lld\nimage_size %lld\nunclean %d\n",
-        hexa, (long long)id->file_size, (long long)id->image_size, id->unclean ? 1 : 0);
-    for (i = 0; i < rep->count; i++) {
-        const dd_fs_volume *v = &rep->vols[i];
-        put(&t, "volume %d %lld %lld %lld %d %d ", v->partition, (long long)v->start, (long long)v->size,
-            (long long)v->used, v->sparse ? 1 : 0, v->unclean ? 1 : 0);
-        if (v->type[0])
-            put_utf8(&t, v->type);
-        else
-            put(&t, "-");
-        put(&t, " ");
-        put_utf8(&t, v->note);
-        put(&t, "\n");
-    }
-    while (pos < id->image_size) {
-        bool used;
-        int64_t n = dd__fsmap_run(fm, pos, id->image_size - pos, &used);
-        if (!used) {
-            if (free_at >= 0 && free_at + free_len == pos) {
-                free_len += n;
-            } else {
-                if (free_at >= 0)
-                    put(&t, "free %lld %lld\n", (long long)free_at, (long long)free_len);
-                free_at = pos;
-                free_len = n;
-            }
-        }
-        pos += n;
-    }
-    if (free_at >= 0)
-        put(&t, "free %lld %lld\n", (long long)free_at, (long long)free_len);
-    if (!t.failed) {
-        dd__sha256 *sh = dd__sha256_new();
-        uint8_t d[32];
-        if (t.len > MAX_MAP_FILE - 128) {
-            dd__sha256_free(sh);
-            free(t.p);
-            return ERROR_FILE_TOO_LARGE;    /* dd__fsmap_load would refuse it */
-        }
-        if (sh) {
-            dd__sha256_update(sh, t.p, (DWORD)t.len);
-            if (dd__sha256_final(sh, d)) {
-                dd__hex(d, hex);
-                for (i = 0; i < 65; i++)
-                    hexa[i] = (char)hex[i];
-                put(&t, "check %s\nend\n", hexa);
-            } else {
-                t.failed = true;
-            }
-        } else {
-            t.failed = true;
-        }
-        dd__sha256_free(sh);
-    }
-    if (t.failed) {
-        free(t.p);
-        return ERROR_NOT_ENOUGH_MEMORY;
-    }
-
-    /* written beside it, then put in place, so an old map is never half replaced */
-    _snwprintf_s(tmp, sizeof tmp / sizeof *tmp, _TRUNCATE, L"%ls.tmp", path);
-    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        e = GetLastError();
-    } else {
-        if (!WriteFile(h, t.p, (DWORD)t.len, &w, NULL) || w != t.len)
-            e = GetLastError() ? GetLastError() : ERROR_WRITE_FAULT;
-        if (!CloseHandle(h) && !e)
-            e = GetLastError();
-        if (!e && !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            e = GetLastError();
-        if (e)
-            DeleteFileW(tmp);
-    }
-    free(t.p);
-    return e;
-}
-
-static int hexval(char c)
-{
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-}
-
-static void get_utf8(const char *s, size_t n, wchar_t *out, size_t outn)
-{
-    int k = MultiByteToWideChar(CP_UTF8, 0, s, (int)n, out, (int)outn - 1);
-    out[k > 0 ? k : 0] = 0;
-}
-
-dd__fsmap *dd__fsmap_load(const wchar_t *path, dd__map_id *id, dd_fs_report *rep, DWORD *err)
-{
-    dd__fsmap *fm = NULL;
-    dd_fs_report *r = rep ? rep : calloc(1, sizeof *r);
-    LARGE_INTEGER size;
-    char *buf = NULL, *line, *next;
-    int64_t last_end = 0, free_total = 0, *vol_free = NULL;
-    bool magic = false, ended = false, have_sha = false, checked = false;
-    uint8_t body[32];
-    HANDLE h;
-    DWORD got;
-    size_t k, x;
-
-    memset(id, 0, sizeof *id);
-    id->file_size = id->image_size = -1;
-    *err = 0;
-    if (!r) {
-        *err = ERROR_NOT_ENOUGH_MEMORY;
-        return NULL;
-    }
-    memset(r, 0, sizeof *r);
-    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        *err = GetLastError();
-        goto out;
-    }
-    if (!GetFileSizeEx(h, &size) || size.QuadPart > MAX_MAP_FILE) {
-        *err = ERROR_INVALID_DATA;      /* save_map never writes one so large */
-        CloseHandle(h);
-        goto out;
-    }
-    if ((buf = malloc((size_t)size.QuadPart + 1)) == NULL ||
-        !ReadFile(h, buf, (DWORD)size.QuadPart, &got, NULL) || got != (DWORD)size.QuadPart) {
-        *err = buf ? ERROR_INVALID_DATA : ERROR_NOT_ENOUGH_MEMORY;
-        CloseHandle(h);
-        goto out;
-    }
-    CloseHandle(h);
-    buf[size.QuadPart] = 0;
-    /* the "check" line holds the SHA-256 of everything before it */
-    {
-        char *ck = NULL, *f = buf;
-        dd__sha256 *sh;
-        while ((f = strstr(f, "\ncheck ")) != NULL)
-            ck = ++f;
-        if (!ck || (sh = dd__sha256_new()) == NULL) {
-            *err = ck ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_DATA;
-            goto out;
-        }
-        dd__sha256_update(sh, buf, (DWORD)(ck - buf));
-        if (!dd__sha256_final(sh, body)) {
-            dd__sha256_free(sh);
-            *err = ERROR_NOT_ENOUGH_MEMORY;
-            goto out;
-        }
-        dd__sha256_free(sh);
-    }
-    if ((fm = calloc(1, sizeof *fm)) == NULL) {
-        *err = ERROR_NOT_ENOUGH_MEMORY;
-        goto out;
-    }
-
-    for (line = buf; line && *line && !ended; line = next) {
-        long long a, b, c;
-        int p, s, u, n = 0, i;
-        char *nl = strchr(line, '\n');
-        next = nl ? nl + 1 : NULL;
-        if (nl)
-            *nl = 0;
-        if (!magic) {
-            if (strcmp(line, MAP_MAGIC) != 0)
-                break;
-            magic = true;
-        } else if (checked && strcmp(line, "end") != 0) {
-            break;                  /* nothing but "end" after the check */
-        } else if (strncmp(line, "sha256 ", 7) == 0 && strlen(line) == 7 + 64) {
-            for (i = 0; i < 32; i++) {
-                int hi = hexval(line[7 + 2 * i]), lo = hexval(line[8 + 2 * i]);
-                if (hi < 0 || lo < 0)
-                    break;
-                id->sha256[i] = (uint8_t)(hi << 4 | lo);
-            }
-            have_sha = i == 32;
-        } else if (sscanf_s(line, "file_size %lld", &a) == 1) {
-            id->file_size = a;
-        } else if (sscanf_s(line, "image_size %lld", &a) == 1) {
-            id->image_size = a;
-        } else if (sscanf_s(line, "unclean %d", &u) == 1) {
-            id->unclean = u != 0;
-        } else if (sscanf_s(line, "volume %d %lld %lld %lld %d %d %n", &p, &a, &b, &c, &s, &u, &n) == 6 && n > 0 &&
-                   r->count < DD_MAX_PARTITIONS) {
-            dd_fs_volume *v = &r->vols[r->count++];
-            char *type = line + n, *sp = strchr(type, ' ');
-            v->partition = p;
-            v->start = a;
-            v->size = b;
-            v->used = c;
-            v->sparse = s != 0;
-            v->unclean = u != 0;
-            get_utf8(type, sp ? (size_t)(sp - type) : strlen(type), v->type, sizeof v->type / sizeof *v->type);
-            if (wcscmp(v->type, L"-") == 0)
-                v->type[0] = 0;
-            if (sp)
-                get_utf8(sp + 1, strlen(sp + 1), v->note, sizeof v->note / sizeof *v->note);
-        } else if (strncmp(line, "check ", 6) == 0 && strlen(line) == 6 + 64) {
-            for (i = 0; i < 32; i++) {
-                int hi = hexval(line[6 + 2 * i]), lo = hexval(line[7 + 2 * i]);
-                if (hi < 0 || lo < 0 || (uint8_t)(hi << 4 | lo) != body[i])
-                    break;
-            }
-            if (i != 32)
-                break;
-            checked = true;
-        } else if (sscanf_s(line, "free %lld %lld", &a, &b) == 2) {
-            region *rg;
-            if (a < last_end || b <= 0 || id->image_size < 0 || b > id->image_size - a)
-                break;              /* out of order, or outside the image */
-            if ((rg = add_region(fm)) == NULL) {
-                *err = ERROR_NOT_ENOUGH_MEMORY;
-                goto out;
-            }
-            rg->start = rg->bits_start = a;
-            rg->end = rg->bits_end = a + b;
-            rg->free_run = true;
-            last_end = a + b;
-            free_total += b;
-        } else if (strcmp(line, "end") == 0) {
-            ended = true;
-        } else {
-            break;
-        }
-    }
-    if (!ended || !checked || !have_sha || id->file_size < 0 || id->image_size < 0) {
-        *err = ERROR_INVALID_DATA;
-        goto out;
-    }
-    /* every free byte lies in a volume read sparsely, and adds up to what
-       that volume says is free */
-    if ((vol_free = calloc(r->count + 1, sizeof *vol_free)) == NULL) {
-        *err = ERROR_NOT_ENOUGH_MEMORY;
-        goto out;
-    }
-    for (x = 0; x < fm->n; x++) {
-        const region *rg = &fm->r[x];
-        int64_t covered = 0;
-        for (k = 0; k < r->count; k++) {
-            const dd_fs_volume *v = &r->vols[k];
-            int64_t a0 = rg->start > v->start ? rg->start : v->start;
-            int64_t b0 = rg->end < v->start + v->size ? rg->end : v->start + v->size;
-            if (v->sparse && b0 > a0) {
-                vol_free[k] += b0 - a0;
-                covered += b0 - a0;
-            }
-        }
-        if (covered != rg->end - rg->start) {
-            *err = ERROR_INVALID_DATA;
-            goto out;
-        }
-    }
-    for (k = 0; k < r->count; k++)
-        if (r->vols[k].sparse && vol_free[k] != r->vols[k].size - r->vols[k].used) {
-            *err = ERROR_INVALID_DATA;
-            goto out;
-        }
-    r->size = id->image_size;
-    r->read = id->image_size - free_total;
-
-out:
-    free(buf);
-    free(vol_free);
-    if (r != rep)
-        free(r);
-    if (*err) {
-        dd__fsmap_free(fm);
-        fm = NULL;
-    }
-    return fm;
-}
-
-/* ---- making the map of a compressed image ----------------------------------- */
-
-typedef struct maker {
+typedef struct mapper {
     dd__xz_seek        *z;
     const dd_callbacks *cb;
     dd_cancel          *cancel;
@@ -913,213 +577,126 @@ typedef struct maker {
     LARGE_INTEGER       freq, start;
     double              last;
     DWORD               error;      /* the first read that failed */
-} maker;
+} mapper;
 
-static double since(const maker *mk)
+static double since(const mapper *mp)
 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return (double)(now.QuadPart - mk->start.QuadPart) / (double)mk->freq.QuadPart;
-}
-
-static void tick(maker *mk)
-{
-    double now;
-
-    if (!mk->cb || !mk->cb->progress || !mk->cb->progress_interval_ms)
-        return;
-    now = since(mk);
-    if (now - mk->last >= mk->cb->progress_interval_ms / 1000.0) {
-        mk->last = now;
-        mk->st->phase_elapsed = now;
-        mk->st->elapsed = now;
-        mk->cb->progress(mk->cb->ctx, mk->st);
-    }
+    return (double)(now.QuadPart - mp->start.QuadPart) / (double)mp->freq.QuadPart;
 }
 
 static void on_decoded(void *ctx, uint64_t decoded)
 {
-    maker *mk = ctx;
-    mk->st->phase_done = (int64_t)decoded;
-    tick(mk);
+    mapper *mp = ctx;
+    double now;
+
+    mp->st->phase_done = (int64_t)decoded;
+    if (!mp->cb || !mp->cb->progress || !mp->cb->progress_interval_ms)
+        return;
+    now = since(mp);
+    if (now - mp->last >= mp->cb->progress_interval_ms / 1000.0) {
+        mp->last = now;
+        mp->st->phase_elapsed = now;
+        mp->cb->progress(mp->cb->ctx, mp->st);
+    }
 }
 
 static DWORD read_xz(void *ctx, int64_t off, void *buf, size_t len)
 {
-    maker *mk = ctx;
-
+    mapper *mp = ctx;
     DWORD e;
 
-    if (mk->cancel && mk->cancel->requested)
+    if (mp->cancel && mp->cancel->requested)
         return ERROR_OPERATION_ABORTED;
-    e = dd__xz_seek_read(mk->z, off, buf, len);
-    if (e && !mk->error)
-        mk->error = e;
+    e = dd__xz_seek_read(mp->z, off, buf, len);
+    if (e && !mp->error)
+        mp->error = e;
     return e;
 }
 
-static bool has_xz_magic(HANDLE h)
+HANDLE dd__fs_hold(const wchar_t *path, DWORD *err)
 {
-    uint8_t head[8];
-    OVERLAPPED ov;
-    DWORD got = 0;
+    wchar_t *norm = dd__normalize_path(path);
+    HANDLE h;
 
-    memset(&ov, 0, sizeof ov);
-    return ReadFile(h, head, sizeof head, &got, &ov) && dd__xz_magic(head, got);
+    if (!norm) {
+        *err = ERROR_NOT_ENOUGH_MEMORY;
+        return INVALID_HANDLE_VALUE;
+    }
+    /* readers only: refused while anyone has it open to write */
+    h = CreateFileW(norm, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+    *err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    free(norm);
+    return h;
 }
 
-dd_result dd_make_sparse_map(const wchar_t *image, bool allow_unclean, const dd_callbacks *cb,
-                             dd_cancel *cancel, dd_stats *stats, dd_fs_report *out)
+dd__fsmap *dd__fsmap_build_xz(HANDLE h, int64_t image_size, bool allow_unclean, const dd_callbacks *cb,
+                              dd_cancel *cancel, dd_stats *st, dd_fs_report *rep, DWORD *err)
 {
     dd_stats local;
-    dd_fs_report *rep = NULL;
     dd__fsmap *fm = NULL;
     dd__fs_source src;
-    dd__sha256 *sha = NULL;
-    dd__map_id id;
-    maker mk;
-    wchar_t *norm = NULL, mapname[1100], m[256], a[32], b[32];
     LARGE_INTEGER fsize;
-    uint8_t *buf = NULL;
-    dd_result res = DD_FAILED;
-    HANDLE h = INVALID_HANDLE_VALUE;
-    int64_t pos;
-    DWORD e = 0, got;
+    mapper mp;
 
-    if (!stats)
-        stats = &local;
-    memset(stats, 0, sizeof *stats);
-    stats->bytes_total = stats->xz_bytes = stats->xz_done = -1;
-    stats->phase = DD_PHASE_MAP;
-    stats->phase_total = -1;
-    memset(&mk, 0, sizeof mk);
-    mk.cb = cb;
-    mk.cancel = cancel;
-    mk.st = stats;
-    QueryPerformanceFrequency(&mk.freq);
-    QueryPerformanceCounter(&mk.start);
+    *err = 0;
+    if (!st)
+        st = &local;
+    memset(&mp, 0, sizeof mp);
+    mp.cb = cb;
+    mp.cancel = cancel;
+    mp.st = st;
+    QueryPerformanceFrequency(&mp.freq);
+    QueryPerformanceCounter(&mp.start);
+    st->phase = DD_PHASE_MAP;
+    st->phase_done = 0;
+    st->phase_total = -1;
+    st->phase_elapsed = 0;
 
-    if (!image || !dd_sparse_map_name(image, mapname, sizeof mapname / sizeof *mapname) ||
-        (norm = dd__normalize_path(image)) == NULL) {
-        dd__msg(cb, DD_MSG_ERROR, L"a sparse map is made for an image file");
-        goto done;
+    if (!GetFileSizeEx(h, &fsize)) {
+        *err = GetLastError();
+        goto out;
     }
-    /* no writers: the file hashed must be the one mapped */
-    h = CreateFileW(norm, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE || !GetFileSizeEx(h, &fsize)) {
-        dd_errstr(GetLastError(), m, 256);
-        dd__msg(cb, DD_MSG_ERROR, L"cannot open '%ls': %ls", image, m);
-        goto done;
+    if ((*err = dd__xz_seek_open(&mp.z, h, fsize.QuadPart)) != 0)
+        goto out;
+    if (image_size >= 0 && dd__xz_seek_size(mp.z) != image_size) {
+        *err = ERROR_INVALID_DATA;      /* not the image the caller opened */
+        goto out;
     }
-    if (!has_xz_magic(h)) {
-        dd__msg(cb, DD_MSG_ERROR,
-                L"'%ls' is not xz-compressed: --sparse-read maps an uncompressed image as it reads it, so it needs no sparse map",
-                image);
-        goto done;
-    }
-    rep = malloc(sizeof *rep);
-    if (!rep || (e = dd__xz_seek_open(&mk.z, h, fsize.QuadPart)) != 0) {
-        dd_errstr(rep ? e : ERROR_NOT_ENOUGH_MEMORY, m, 256);
-        dd__msg(cb, DD_MSG_ERROR, L"cannot read '%ls': %ls", image, m);
-        goto done;
-    }
-    stats->started = true;
-    dd__xz_seek_set_progress(mk.z, on_decoded, &mk);
-    dd__msg(cb, DD_MSG_INFO, L"mapping the file systems of '%ls' (decompressing the parts they need)", image);
+    dd__xz_seek_set_progress(mp.z, on_decoded, &mp);
 
     memset(&src, 0, sizeof src);
     src.rd = read_xz;
-    src.rd_ctx = &mk;
-    src.size = dd__xz_seek_size(mk.z);
-    fm = dd__fsmap_build(&src, allow_unclean, rep, &e);
-    if (cancel && cancel->requested) {
-        res = DD_CANCELLED;
-        goto done;
-    }
-    if (!fm) {
-        dd__msg(cb, DD_MSG_ERROR, L"memory exhausted");
-        goto done;
-    }
+    src.rd_ctx = &mp;
+    src.size = dd__xz_seek_size(mp.z);
+    fm = dd__fsmap_build(&src, allow_unclean, rep, err);
+    if (cancel && cancel->requested)
+        *err = ERROR_OPERATION_ABORTED;
     /* inside a compressed file, any read that fails means it is damaged:
        a map made around the gap would not be the image's */
-    if (mk.error) {
-        dd_errstr(mk.error, m, 256);
-        dd__msg(cb, DD_MSG_ERROR, L"cannot map '%ls': %ls", image, m);
-        goto done;
-    }
+    else if (fm && mp.error)
+        *err = mp.error;
 
-    /* the map belongs to this .xz file: its hash, checked as it is read */
-    stats->phase_done = 0;
-    stats->phase_total = fsize.QuadPart;
-    sha = dd__sha256_new();
-    buf = malloc(1u << 20);
-    if (!sha || !buf) {
-        dd__msg(cb, DD_MSG_ERROR, L"memory exhausted");
-        goto done;
+out:
+    st->phase_elapsed = since(&mp);
+    if (cb && cb->progress && cb->progress_interval_ms)
+        cb->progress(cb->ctx, st);
+    if (*err) {
+        dd__fsmap_free(fm);
+        fm = NULL;
     }
-    for (pos = 0; pos < fsize.QuadPart; pos += got) {
-        OVERLAPPED ov;
-        if (cancel && cancel->requested) {
-            res = DD_CANCELLED;
-            goto done;
-        }
-        memset(&ov, 0, sizeof ov);
-        ov.Offset = (DWORD)pos;
-        ov.OffsetHigh = (DWORD)((uint64_t)pos >> 32);
-        if (!ReadFile(h, buf, 1u << 20, &got, &ov) || got == 0) {
-            dd_errstr(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF, m, 256);
-            dd__msg(cb, DD_MSG_ERROR, L"error reading '%ls': %ls", image, m);
-            goto done;
-        }
-        dd__sha256_update(sha, buf, got);
-        stats->phase_done = pos + got;
-        tick(&mk);
-    }
-    memset(&id, 0, sizeof id);
-    if (!dd__sha256_final(sha, id.sha256)) {
-        dd__msg(cb, DD_MSG_ERROR, L"cannot compute the SHA-256 of '%ls'", image);
-        goto done;
-    }
-    id.file_size = fsize.QuadPart;
-    id.image_size = src.size;
-    id.unclean = allow_unclean;
-    e = save_map(mapname, fm, rep, &id);
-    if (e) {
-        dd_errstr(e, m, 256);
-        dd__msg(cb, DD_MSG_ERROR, L"cannot write the sparse map %ls: %ls", mapname, m);
-        goto done;
-    }
-    dd_format_size(rep->read, false, a, 32);
-    dd_format_size(rep->size, false, b, 32);
-    dd__msg(cb, DD_MSG_INFO, L"sparse map written to %ls: --sparse-read keeps %ls of %ls", mapname, a, b);
-    if (out)
-        *out = *rep;
-    res = DD_OK;
-
-done:
-    stats->phase_elapsed = stats->elapsed = since(&mk);
-    if (cb && cb->progress && stats->started)
-        cb->progress(cb->ctx, stats);
-    dd__sha256_free(sha);
-    free(buf);
-    dd__fsmap_free(fm);
-    dd__xz_seek_free(mk.z);
-    free(rep);
-    free(norm);
-    if (h != INVALID_HANDLE_VALUE)
-        CloseHandle(h);
-    return res;
+    dd__xz_seek_free(mp.z);
+    return fm;
 }
 
-/* ---- the public report ------------------------------------------------- */
-
-bool dd_fs_report_read(const wchar_t *path, bool allow_unclean, dd_fs_report *out, wchar_t *err, size_t errlen)
+bool dd_fs_report_read(const wchar_t *path, bool allow_unclean, const dd_callbacks *cb, dd_cancel *cancel,
+                       dd_stats *stats, dd_fs_report *out, wchar_t *err, size_t errlen)
 {
     dd_endpoint ep;
     dd__fs_source src;
     dd__fsmap *fm;
-    dd__map_id id;
-    wchar_t m[256], mapname[1100];
+    wchar_t m[256];
     bool xz = false;
     DWORD e;
 
@@ -1135,52 +712,44 @@ bool dd_fs_report_read(const wchar_t *path, bool allow_unclean, dd_fs_report *ou
         return false;
     }
     if (xz) {
-        /* answered by its sparse map, if it is this image's */
-        int64_t file_size = ep.xz_file_size, image_size = ep.size;
+        int64_t image_size = ep.size;
+        bool file = ep.own_handle;      /* xz is only detected in files */
         ep_close(&ep);
-        if (!dd_sparse_map_name(path, mapname, sizeof mapname / sizeof *mapname) ||
-            (fm = dd__fsmap_load(mapname, &id, out, &e)) == NULL) {
-            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
-                _snwprintf_s(err, errlen, _TRUNCATE, L"'%ls' is xz-compressed and has no sparse map (%ls); make one with --make-sparse-map",
-                             path, mapname);
-            else {
-                dd_errstr(e, m, 256);
-                _snwprintf_s(err, errlen, _TRUNCATE, L"cannot use the sparse map %ls: %ls", mapname, m);
-            }
-            memset(out, 0, sizeof *out);
+        if (!file) {
+            _snwprintf_s(err, errlen, _TRUNCATE, L"'%ls' is xz-compressed and comes from standard input, so it cannot be mapped", path);
             return false;
         }
-        dd__fsmap_free(fm);
-        if (id.file_size != file_size || id.image_size != image_size) {
-            _snwprintf_s(err, errlen, _TRUNCATE, L"the sparse map %ls is for another image; make it again", mapname);
-            memset(out, 0, sizeof *out);
+        HANDLE h = dd__fs_hold(path, &e);
+        if (h == INVALID_HANDLE_VALUE) {
+            dd_errstr(e, m, 256);
+            _snwprintf_s(err, errlen, _TRUNCATE, L"cannot open '%ls': %ls", path, m);
             return false;
         }
-        /* as a copy would: such a map is used only when asked for */
-        if (id.unclean && !allow_unclean) {
-            _snwprintf_s(err, errlen, _TRUNCATE,
-                         L"the sparse map %ls was made with --allow-unclean; give --allow-unclean too, or make the map again without it",
-                         mapname);
-            memset(out, 0, sizeof *out);
+        fm = dd__fsmap_build_xz(h, image_size, allow_unclean, cb, cancel, stats, out, &e);
+        CloseHandle(h);
+    } else {
+        if ((ep.kind != EP_FILE && ep.kind != EP_BLOCK) || ep.size < 0) {
+            _snwprintf_s(err, errlen, _TRUNCATE, L"'%ls' is not an image file or a device", path);
+            ep_close(&ep);
             return false;
         }
-        return true;
-    }
-    if ((ep.kind != EP_FILE && ep.kind != EP_BLOCK) || ep.size < 0) {
-        _snwprintf_s(err, errlen, _TRUNCATE, L"'%ls' is not an image file or a device", path);
+        memset(&src, 0, sizeof src);
+        src.h = ep.h;
+        src.size = ep.size;
+        src.device = ep.kind == EP_BLOCK;
+        src.is_volume = ep.is_volume;
+        fm = dd__fsmap_build(&src, allow_unclean, out, &e);
         ep_close(&ep);
-        return false;
     }
-    memset(&src, 0, sizeof src);
-    src.h = ep.h;
-    src.size = ep.size;
-    src.device = ep.kind == EP_BLOCK;
-    src.is_volume = ep.is_volume;
-    fm = dd__fsmap_build(&src, allow_unclean, out, &e);
-    ep_close(&ep);
     if (!fm) {
-        dd_errstr(e, m, 256);
-        _snwprintf_s(err, errlen, _TRUNCATE, L"'%ls': %ls", path, m);
+        if (e == ERROR_OPERATION_ABORTED)
+            _snwprintf_s(err, errlen, _TRUNCATE, L"mapping '%ls' was stopped", path);
+        else {
+            dd_errstr(e, m, 256);
+            _snwprintf_s(err, errlen, _TRUNCATE, L"cannot map the file systems of '%ls': %ls",
+                         path, e == ERROR_INVALID_DATA ? L"it is damaged" : m);
+        }
+        memset(out, 0, sizeof *out);
         return false;
     }
     dd__fsmap_free(fm);

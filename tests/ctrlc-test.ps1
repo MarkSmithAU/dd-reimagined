@@ -74,6 +74,15 @@ try {
     $detail = "sent=$($r.Sent) exited=$($r.Exited) code=$($r.Code) err=$($r.Err)"
     Check 'Ctrl+C unblocks a pipe read' ($r.Exited) $detail
     Check 'blocked pipe read exits 130' ($r.Code -eq '130') $detail
+
+    # Level 9 threads each hold a block of up to 192 MiB.  Finishing them
+    # would take minutes; Ctrl+C ends them instead, leaving the .xz short.
+    $r = Interrupt "`"$DD`" if=/dev/urandom of=stop.xz --xz=9 bs=1M" 3000
+    $detail = "sent=$($r.Sent) exited=$($r.Exited) code=$($r.Code) err=$($r.Err)"
+    Check 'Ctrl+C stops compressing at once' ($r.Exited) $detail
+    Check 'stopped compression exits 130' ($r.Code -eq '130') $detail
+    Check 'stopped compression deletes the incomplete .xz' ($r.Err -match 'deleted the incomplete output file' -and
+        -not (Test-Path (Join-Path $work 'stop.xz'))) $detail
 } finally {
     Get-Process timeout -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

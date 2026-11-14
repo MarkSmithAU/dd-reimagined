@@ -14,7 +14,7 @@ If you cannot agree with the above, do not use it.
 
 ## About
 
-Version 1.0.1. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
+Version 1.0.2. A C rewrite of John Newbigin's dd for Windows 0.6beta3. It
 behaves like GNU dd, keeps 0.6's Windows extras (`--list`, `id=`/`od=`,
 `--filter`, `dd-<filter>.exe` naming) and adds a graphical front end and
 the features below.
@@ -78,7 +78,6 @@ disk, its size and drive letters.
     dd --layout if=card.img.xz                        show an image's partition table
     dd --verify-hashes if=card.img.xz                 check an image against its hash file
     dd if=card.img.xz od=E: --fit --verify            write it back and read it back
-    dd if=card.img.xz --make-sparse-map               map a compressed image for --sparse-read
 
 `dd --help` lists every operand and option.
 

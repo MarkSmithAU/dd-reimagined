@@ -68,6 +68,7 @@ BEGIN
     AUTOCHECKBOX    "&Force dismount if in use", IDC_FORCE, 271, 161, 238, 10
     AUTOCHECKBOX    "Write a hash fil&e", IDC_HASHES, 271, 174, 238, 10
     AUTOCHECKBOX    "Verif&y what is written", IDC_VERIFY, 271, 187, 238, 10
+    AUTOCHECKBOX    "&Delete the image file if stopped or failed", IDC_DELPARTIAL, 271, 200, 238, 10
 
     LTEXT           "Co&mpression:", -1, 7, 223, 44, 8
     COMBOBOX        IDC_XZ, 52, 221, 200, 150, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
@@ -80,7 +81,6 @@ BEGIN
     EDITTEXT        IDC_LOG, 7, 278, 506, 88, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
 
     PUSHBUTTON      "Command &line", IDC_CMDLINE, 7, 373, 70, 14
-    PUSHBUTTON      "Make s&parse map", IDC_MAKEMAP, 82, 373, 75, 14
     DEFPUSHBUTTON   "&Start", IDC_START, 353, 373, 50, 14
     PUSHBUTTON      "S&top", IDC_STOP, 408, 373, 50, 14
     PUSHBUTTON      "Close", IDCANCEL, 463, 373, 50, 14

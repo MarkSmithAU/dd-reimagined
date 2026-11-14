@@ -59,6 +59,9 @@ typedef struct job {
     bool                make_hashes;
     bool                hashes_shared;  /* out_hashes is the input's hash file too */
     bool                out_is_file;   /* a file opened by dd (compression makes it a stream) */
+    bool                out_replaced;  /* all of the output file is this run's: dd opened
+                                          it, and it was cut to where writing starts, at 0 */
+    bool                out_complete;  /* the copy wrote all it was to (and ended an .xz) */
     wchar_t             out_hashes[HASH_PATH];
     int64_t             out_start;     /* where the data begins in the output */
     int64_t             out_bytes;
@@ -74,12 +77,10 @@ typedef struct job {
     uint64_t            xz_reserve;    /* of it, kept back for everything else */
 
     dd__fsmap          *fsmap;         /* sparse_read: the input's used space */
-    bool                sparse_stream; /* a compressed input, read in order: its
-                                          sparse map's free space is zeroed */
-    uint8_t             map_sha[32];   /* the .xz file the sparse map is for */
-    const wchar_t      *raw_want_from; /* where in_raw_want comes from: the hash
-                                          file, or the sparse map */
-    wchar_t             map_path[HASH_PATH];
+    bool                sparse_stream; /* a compressed input, read in order: what
+                                          fsmap says is free is zeroed */
+    HANDLE              in_hold;       /* sparse_stream: keeps writers out of the
+                                          input from mapping to the end */
 } job;
 
 void dd_cancel_init(dd_cancel *c)
@@ -284,7 +285,7 @@ static DWORD in_read(job *j, uint8_t *buf, DWORD len, DWORD *got)
     return j->fsmap && !j->sparse_stream ? sparse_read(j, buf, len, got) : ep_read(&j->in, buf, len, got);
 }
 
-/* A compressed input is read in order: what its sparse map says is free
+/* A compressed input is read in order: what its map says is free
    is zeroed after reading (and after hashing, so its hashes still check). */
 static void zero_free(job *j, uint8_t *buf, int64_t at, DWORD n)
 {
@@ -815,6 +816,8 @@ static dd_result copy_loop(job *j)
     dd_result res = DD_OK;
     int64_t max_records = -1, max_bytes = 0;
     bool write_stopped = false;
+    bool read_stopped = false;  /* a read error ended it; one conv=noerror skips does not */
+    bool tail_failed = false;   /* what follows the data (sparse end, GPT) failed */
     wchar_t m[256];
     DWORD e;
 
@@ -856,6 +859,7 @@ static dd_result copy_loop(job *j)
             /* nothing after an error in a compressed stream can be found */
             if (!(opt->conv & DD_CONV_NOERROR) || j->in.xz) {
                 res = DD_FAILED;
+                read_stopped = true;
                 break;      /* still write what is already gathered */
             }
             res = DD_FAILED;
@@ -943,13 +947,17 @@ static dd_result copy_loop(job *j)
             dd__msg(j->cb, DD_MSG_ERROR, L"failed to truncate to %lld bytes in output file '%ls': %ls",
                     (long long)j->out.pos, j->out.name, m);
             res = DD_FAILED;
+            tail_failed = true;
         }
     }
 
-    if (res == DD_OK && j->have_gpt)
-        res = write_gpt(j);
-    if (res == DD_OK && j->clear_len)
-        res = clear_end(j);
+    if (res == DD_OK && j->have_gpt && (res = write_gpt(j)) != DD_OK)
+        tail_failed = true;
+    if (res == DD_OK && j->clear_len && (res = clear_end(j)) != DD_OK)
+        tail_failed = true;
+    /* all of the input was copied, even if conv=noerror skipped some of it
+       (and so the result is a failure): the output is as whole as it gets */
+    j->out_complete = !write_stopped && !read_stopped && !tail_failed;
 
     /* Raw devices are always flushed: Windows has no sync command and
        the device may be unplugged as soon as dd exits. */
@@ -1098,7 +1106,7 @@ static dd_result check_input(job *j)
 
     if (j->in_raw_want)
         ok = hash_matches(j, j->in_raw_hash, j->in_raw_want, dd__base_name(j->opt->input),
-                          j->raw_want_from ? j->raw_want_from : j->in_hashes);
+                          j->in_hashes);
     if (j->in_want) {
         if (j->in.xz) {
             dd__uncompressed_name(j->opt->input, name, MAX_PATH);
@@ -1536,63 +1544,46 @@ static void report_sparse(job *j, const dd_fs_report *rep)
     dd__msg(j->cb, DD_MSG_INFO, L"sparse read: reading %ls of %ls; the rest is free space, written as zeros", a, b);
 }
 
-/* A compressed input: its free space comes from its sparse map, which must
-   be this image's.  Its sizes are checked now, and the hash of the .xz
-   file as it is read (the input is drained after the copy if need be). */
+/* A compressed input: read in order, so its file systems are mapped first,
+   through a second decoder that seeks: it decompresses only the parts they
+   need.  The input is held against writers until dd_run ends, so the image
+   mapped is the one copied. */
 static dd_result setup_sparse_stream(job *j, dd_fs_report *rep)
 {
     const dd_options *opt = j->opt;
-    dd__map_id id;
     wchar_t m[256];
     DWORD e;
 
-    if (!dd_sparse_map_name(opt->input, j->map_path, HASH_PATH)) {
-        dd__msg(j->cb, DD_MSG_ERROR, L"'%ls' is xz-compressed, and has no name for its sparse map", j->in.name);
-        return DD_FAILED;
-    }
-    j->fsmap = dd__fsmap_load(j->map_path, &id, rep, &e);
-    if (!j->fsmap) {
-        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
-            dd__msg(j->cb, DD_MSG_ERROR,
-                    L"'%ls' is xz-compressed, so it is read in order, and --sparse-read needs its file systems mapped first: "
-                    L"there is no sparse map %ls; make it with dd --make-sparse-map if=\"%ls\"%ls (or the GUI's Make sparse map button)",
-                    j->in.name, j->map_path, opt->input, opt->sparse_unclean ? L" --allow-unclean" : L"");
-            return DD_FAILED;
-        }
-        dd_errstr(e, m, 256);
-        dd__msg(j->cb, DD_MSG_ERROR, L"cannot use the sparse map %ls: %ls", j->map_path,
-                e == ERROR_INVALID_DATA ? L"it is damaged; make it again" : m);
-        return DD_FAILED;
-    }
-    if (id.file_size != j->in.xz_file_size || id.image_size != j->in.size) {
-        dd__msg(j->cb, DD_MSG_ERROR, L"the sparse map %ls is for another image than '%ls'; make it again",
-                j->map_path, j->in.name);
-        return DD_FAILED;
-    }
-    if (id.unclean && !opt->sparse_unclean) {
+    if (!j->in.own_handle) {       /* standard input: no name to open it again by */
         dd__msg(j->cb, DD_MSG_ERROR,
-                L"the sparse map %ls was made with --allow-unclean; give --allow-unclean too, or make the map again without it",
-                j->map_path);
+                L"'%ls' is xz-compressed and comes from standard input: --sparse-read maps a compressed image by opening it again, to read it out of order",
+                j->in.name);
         return DD_FAILED;
     }
-    memcpy(j->map_sha, id.sha256, 32);
-    if (j->in_raw_want) {
-        if (memcmp(j->in_raw_want, j->map_sha, 32) != 0) {
-            dd__msg(j->cb, DD_MSG_ERROR, L"the sparse map %ls and the hash file %ls disagree about '%ls'; one of them is for another image",
-                    j->map_path, j->in_hashes, j->in.name);
-            return DD_FAILED;
-        }
-    } else {
-        if ((j->in_raw_hash = dd__sha256_new()) == NULL)
-            return no_memory(j);
-        dd__xz_set_hash(j->in.xz, j->in_raw_hash);
-        j->in_raw_want = j->map_sha;
-        j->raw_want_from = j->map_path;
+    j->in_hold = dd__fs_hold(opt->input, &e);
+    if (j->in_hold == INVALID_HANDLE_VALUE) {
+        j->in_hold = NULL;
+        dd_errstr(e, m, 256);
+        dd__msg(j->cb, DD_MSG_ERROR, L"cannot map the file systems of '%ls': %ls", j->in.name,
+                e == ERROR_SHARING_VIOLATION ? L"another program has it open to write" : m);
+        return DD_FAILED;
+    }
+    if (opt->status != DD_STATUS_NONE)
+        dd__msg(j->cb, DD_MSG_INFO, L"mapping the file systems of '%ls' (decompressing the parts they need)", j->in.name);
+    j->fsmap = dd__fsmap_build_xz(j->in_hold, j->in.size, opt->sparse_unclean, j->cb, j->cancel, j->st, rep, &e);
+    j->st->phase = DD_PHASE_COPY;
+    j->st->phase_done = j->st->phase_total = 0;
+    if (!j->fsmap) {
+        if (e == ERROR_OPERATION_ABORTED && cancelled(j))
+            return DD_CANCELLED;
+        dd_errstr(e, m, 256);
+        dd__msg(j->cb, DD_MSG_ERROR, L"cannot map the file systems of '%ls': %ls", j->in.name,
+                e == ERROR_INVALID_DATA ? L"it is damaged" : m);
+        return DD_FAILED;
     }
     j->sparse_stream = true;
     if (opt->status != DD_STATUS_NONE)
-        dd__msg(j->cb, DD_MSG_INFO, L"'%ls' is read in order; its free space, from the sparse map %ls, is written as zeros",
-                j->in.name, j->map_path);
+        dd__msg(j->cb, DD_MSG_INFO, L"'%ls' is read in order; its free space is written as zeros", j->in.name);
     return DD_OK;
 }
 
@@ -1685,8 +1676,8 @@ static dd_result run_job(job *j)
     if (opt->lock_input && ep_lock_input(&j->in, j->cb, opt->keep_letters))
         return DD_FAILED;
     /* after the lock, which flushes the file systems */
-    if (opt->sparse_read && setup_sparse(j) != DD_OK)
-        return DD_FAILED;
+    if (opt->sparse_read && (res = setup_sparse(j)) != DD_OK)
+        return res;
 
     if (!filter_precheck(j)) {
         filter_refused(j);
@@ -1714,6 +1705,8 @@ static dd_result run_job(job *j)
             report(j, L"cannot compress to", &j->out, e);
             return DD_FAILED;
         }
+        if (j->out.xz && j->cancel)
+            dd__xz_set_stop(j->out.xz, &j->cancel->requested);
         if (opt->status != DD_STATUS_NONE && j->out.xz) {
             int level = dd__xz_level(j->out.xz);
             uint32_t threads = ep_xz_threads(&j->out);
@@ -1789,6 +1782,8 @@ static dd_result run_job(job *j)
     if (res != DD_OK)
         return res;
     j->out_start = j->out.pos;
+    j->out_replaced = out_is_file && j->out.own_handle && !opt->seek &&
+                      !(opt->conv & DD_CONV_NOTRUNC) && !(opt->oflags & DD_FLAG_APPEND);
 
     j->st->bytes_total = expected_total(j);
     res = copy_loop(j);
@@ -1878,19 +1873,31 @@ dd_result dd_run(const dd_options *opt, const dd_callbacks *cb, dd_cancel *cance
     cancel_attach(cancel);
     res = opt->check_hashes ? check_only(&j) : run_job(&j);
     if (j.out.xz) {
-        /* end the .xz stream even after an error or Ctrl+C, so what was
-           written so far is a valid (if shorter) image */
-        int64_t compressed;
-        DWORD e = ep_finish_compress(&j.out, &compressed, stats->started ? finish_tick : NULL, &j);
-        if (!e && stats->started) {
-            stats->xz_bytes = compressed;
-            stats->xz_done = dd__xz_compressed_in(j.out.xz);
-        }
-        if (e) {
+        /* End the .xz stream even after an error, so what was written so far
+           is a valid (if shorter) image.  Not once cancelled: the threads
+           would first compress every block they hold, which at a high level
+           takes minutes.  The encoder is left unfinished instead, and
+           ep_close ends its threads within moments. */
+        int64_t compressed = 0;
+        DWORD e = cancelled(&j) ? ERROR_OPERATION_ABORTED
+                : ep_finish_compress(&j.out, &compressed, stats->started ? finish_tick : NULL, &j);
+        if (e)
+            j.out_complete = false;
+        if (e == ERROR_OPERATION_ABORTED && cancelled(&j)) {
+            if (opt->keep_incomplete || !j.out_replaced)        /* else it is deleted below */
+                dd__msg(cb, DD_MSG_WARNING, L"stopped compressing: '%ls' is an incomplete .xz file and will not "
+                        L"decompress to the end", j.out.name);
+            if (res == DD_OK)
+                res = DD_CANCELLED;
+        } else if (e) {
             report(&j, L"error compressing to", &j.out, e);
             if (res == DD_OK)
                 res = DD_FAILED;
-        } else if (stats->started && opt->status != DD_STATUS_NONE) {
+        } else if (stats->started) {
+            stats->xz_bytes = compressed;
+            stats->xz_done = dd__xz_compressed_in(j.out.xz);
+        }
+        if (!e && stats->started && opt->status != DD_STATUS_NONE) {
             wchar_t a[DD_SIZE_EXACT_CHARS], b[DD_SIZE_EXACT_CHARS];
             int64_t total = stats->bytes_written;
             dd_format_size_exact(total, false, false, a, DD_SIZE_EXACT_CHARS);
@@ -1922,7 +1929,25 @@ dd_result dd_run(const dd_options *opt, const dd_callbacks *cb, dd_cancel *cance
         res = verify_output(&j);
     }
     ep_close(&j.in);
-    ep_close(&j.out);
+    {
+        /* stopped or failed while writing a file that is all this run's:
+           what is left is only part of the image, so it goes */
+        wchar_t *drop = res != DD_OK && !opt->keep_incomplete && j.out_replaced && !j.out_complete && j.out.path
+                      ? _wcsdup(j.out.path) : NULL;
+        const wchar_t *name = opt->output_name ? opt->output_name : opt->output;
+        ep_close(&j.out);
+        if (drop) {
+            wchar_t m[256];
+            if (DeleteFileW(drop)) {
+                stats->output_deleted = true;
+                dd__msg(cb, DD_MSG_INFO, L"deleted the incomplete output file '%ls' (--keep-incomplete keeps it)", name);
+            } else {
+                dd_errstr(GetLastError(), m, 256);
+                dd__msg(cb, DD_MSG_WARNING, L"could not delete the incomplete output file '%ls': %ls", name, m);
+            }
+            free(drop);
+        }
+    }
     cancel_detach(cancel);
 
     if (j.ibuf)
@@ -1939,6 +1964,8 @@ dd_result dd_run(const dd_options *opt, const dd_callbacks *cb, dd_cancel *cance
     dd__sha256_free(j.out_raw_hash);
     dd__gpt_fix_free(&j.gpt);
     dd__fsmap_free(j.fsmap);
+    if (j.in_hold)
+        CloseHandle(j.in_hold);
     free(layout);
     return res;
 }
