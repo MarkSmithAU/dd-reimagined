@@ -372,6 +372,9 @@ typedef struct dd_layout {
                                 partition tables and any ISO 9660 volume */
     int64_t  gpt_reserve;    /* GPT: bytes the backup GPT needs at the end of
                                 a disk; 0 otherwise */
+    int64_t  gpt_backup_off; /* GPT: where the primary header says the backup
+                                partition array starts (it is followed by the
+                                backup header); 0 otherwise */
     int64_t  iso_size;       /* ISO 9660 volume size, 0 if none */
     DWORD    mbr_signature;
     GUID     disk_guid;      /* GPT */
@@ -412,6 +415,9 @@ typedef struct dd_fs_report {
     int64_t  size;           /* the input */
     int64_t  read;           /* bytes sparse reading reads; the rest of the
                                 input is free space, written as zeros */
+    int64_t  unpartitioned;  /* of the free space: bytes after the partitions
+                                (past the layout's data_end, short of a GPT's
+                                backup), which no partition table points to */
     size_t   count;
     dd_fs_volume vols[DD_MAX_PARTITIONS];
 } dd_fs_report;

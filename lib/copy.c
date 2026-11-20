@@ -8,6 +8,7 @@
     output blocks.
 */
 #include "fs.h"
+#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,9 @@ typedef enum step { STEP_OK, STEP_FAIL, STEP_CANCEL } step;
 #define HASH_PATH  1040                 /* a .hashes path */
 #define VBUF_SIZE  (1u << 20)           /* verifying and checking read this much at a time */
 #define VALIGN     65536u               /* offsets of unbuffered reads of a file */
-#define SPARSE_GAP (64u << 10)          /* sparse reading reads across smaller free gaps */
+#define SPARSE_GAP (64u << 10)          /* sparse reading reads across smaller free gaps:
+                                           measured on a USB card, a command costs about
+                                           what 64 KiB takes to transfer */
 #define XZ_RESERVE ((uint64_t)4 << 30)  /* free memory compressing leaves to the rest, */
 #define XZ_RESERVE_SWAP ((uint64_t)2 << 30)  /* or this, when there is a page file to fall back on */
 
@@ -239,7 +242,7 @@ static DWORD read_span(job *j, uint8_t *dst, int64_t a, int64_t b, int64_t *reac
    and zeros the rest.  A free gap shorter than SPARSE_GAP is read along
    with its neighbours, as one larger read is faster than two small ones,
    and zeroed afterwards: what comes out does not depend on how it was read. */
-static DWORD sparse_read(job *j, uint8_t *buf, DWORD len, DWORD *got)
+static DWORD sparse_read(job *j, uint8_t *buf, DWORD len, DWORD *got, int64_t *unused)
 {
     dd_endpoint *in = &j->in;
     int64_t start = in->pos, end, reached, p, a = -1, b = -1;
@@ -271,7 +274,7 @@ static DWORD sparse_read(job *j, uint8_t *buf, DWORD len, DWORD *got)
         int64_t n = dd__fsmap_run(j->fsmap, p, reached - p, &used);
         if (!used) {
             memset(buf + (p - start), 0, (size_t)n);
-            j->st->bytes_unused += n;
+            *unused += n;
         }
         p += n;
     }
@@ -280,9 +283,9 @@ static DWORD sparse_read(job *j, uint8_t *buf, DWORD len, DWORD *got)
     return e;
 }
 
-static DWORD in_read(job *j, uint8_t *buf, DWORD len, DWORD *got)
+static DWORD in_read(job *j, uint8_t *buf, DWORD len, DWORD *got, int64_t *unused)
 {
-    return j->fsmap && !j->sparse_stream ? sparse_read(j, buf, len, got) : ep_read(&j->in, buf, len, got);
+    return j->fsmap && !j->sparse_stream ? sparse_read(j, buf, len, got, unused) : ep_read(&j->in, buf, len, got);
 }
 
 /* A compressed input is read in order: what its map says is free
@@ -302,23 +305,32 @@ static void zero_free(job *j, uint8_t *buf, int64_t at, DWORD n)
     }
 }
 
-static DWORD read_block(job *j, uint8_t *buf, DWORD len, DWORD *got)
+/* The reading itself, which the read-ahead thread may do: it touches only
+   the input endpoint and the (fixed) map.  Free space zeroed is added to
+   *unused. */
+static DWORD fetch_block(job *j, uint8_t *buf, DWORD len, DWORD *got, int64_t *unused)
 {
-    int64_t at = j->in.pos;
     DWORD e = 0;
 
     if (j->opt->iflags & DD_FLAG_FULLBLOCK) {
         DWORD total = 0, n;
         while (total < len) {
-            e = in_read(j, buf + total, len - total, &n);
+            e = in_read(j, buf + total, len - total, &n, unused);
             total += n;     /* an error can follow a part that was read */
             if (e || n == 0)
                 break;
         }
         *got = total;
     } else {
-        e = in_read(j, buf, len, got);
+        e = in_read(j, buf, len, got, unused);
     }
+    return e;
+}
+
+/* What follows a read, on the copying thread: the input's hash, zeroing a
+   compressed input's free space, and the partial read warning. */
+static void after_read(job *j, uint8_t *buf, int64_t at, DWORD len, DWORD *got, DWORD e)
+{
     dd__sha256_update(j->in_hash, buf, *got);
     if (j->sparse_stream)
         zero_free(j, buf, at, *got);
@@ -333,7 +345,199 @@ static DWORD read_block(job *j, uint8_t *buf, DWORD len, DWORD *got)
         }
     }
     j->prev_nread = *got;
+}
+
+static DWORD read_block(job *j, uint8_t *buf, DWORD len, DWORD *got)
+{
+    int64_t at = j->in.pos, unused = 0;
+    DWORD e = fetch_block(j, buf, len, got, &unused);
+
+    j->st->bytes_unused += unused;
+    after_read(j, buf, at, len, got, e);
     return e;
+}
+
+/* ---- read-ahead -------------------------------------------------------- */
+
+/* A disk or file input is read by a thread of its own, a few blocks ahead,
+   so that hashing and writing the output overlap the reads rather than
+   follow them: reading a card is the slow part, and it then never waits.
+   The thread reads exactly the blocks the copy loop would (the same sizes,
+   up to the same count), so what is copied does not change.  Not with
+   conv=noerror, where the loop moves the input past an error itself, nor
+   for a compressed input, which the decoder's threads already read ahead. */
+static uint8_t *alloc_buffer(DWORD n);
+
+/* How far ahead: enough that the thread keeps reading used space while the
+   copy hashes a long stretch of free space's zeros, which costs it no reads */
+#define RA_AHEAD     (64u << 20)
+#define RA_SLOTS_MIN 2
+#define RA_SLOTS_MAX 64
+
+typedef struct ra_slot {
+    uint8_t *buf;
+    int64_t  at, unused;
+    DWORD    req, got, err;
+} ra_slot;
+
+typedef struct readahead {
+    job               *j;
+    HANDLE             thread;
+    SRWLOCK            lock;
+    CONDITION_VARIABLE cv;
+    ra_slot            slot[RA_SLOTS_MAX];
+    int                n;          /* slots */
+    int                head;       /* the next slot the copy loop takes */
+    int                filled;     /* slots read and not yet given back */
+    bool               held;       /* the copy loop holds slot[head] */
+    bool               stop, done;
+    int64_t            max_records, max_bytes;
+} readahead;
+
+static unsigned __stdcall ra_thread(void *arg)
+{
+    readahead *ra = arg;
+    job *j = ra->j;
+    int64_t records = 0;
+    int w = 0;
+
+    for (;;) {
+        ra_slot *s;
+        bool last;
+
+        AcquireSRWLockExclusive(&ra->lock);
+        while (ra->filled == ra->n && !ra->stop)
+            SleepConditionVariableSRW(&ra->cv, &ra->lock, INFINITE, 0);
+        if (ra->stop) {
+            ReleaseSRWLockExclusive(&ra->lock);
+            break;
+        }
+        ReleaseSRWLockExclusive(&ra->lock);
+
+        s = &ra->slot[w];
+        s->got = s->err = 0;
+        s->unused = 0;
+        s->at = j->in.pos;
+        if (ra->max_records >= 0 && records >= ra->max_records + (ra->max_bytes ? 1 : 0)) {
+            s->req = 0;     /* count reached: an empty slot ends it */
+        } else if (cancelled(j)) {
+            s->req = 0;
+            s->err = ERROR_OPERATION_ABORTED;
+        } else {
+            s->req = (ra->max_records >= 0 && records >= ra->max_records) ? (DWORD)ra->max_bytes : j->ibs;
+            if (j->opt->conv & DD_CONV_SYNC)
+                memset(s->buf, 0, j->ibs);
+            s->err = fetch_block(j, s->buf, s->req, &s->got, &s->unused);
+            records++;
+        }
+        last = s->req == 0 || s->err || s->got == 0;
+
+        AcquireSRWLockExclusive(&ra->lock);
+        ra->filled++;
+        WakeAllConditionVariable(&ra->cv);
+        ReleaseSRWLockExclusive(&ra->lock);
+        w = (w + 1) % ra->n;
+        if (last)
+            break;
+    }
+    AcquireSRWLockExclusive(&ra->lock);
+    ra->done = true;
+    WakeAllConditionVariable(&ra->cv);
+    ReleaseSRWLockExclusive(&ra->lock);
+    return 0;
+}
+
+static bool ra_wanted(const job *j)
+{
+    return !j->in.xz && (j->in.kind == EP_FILE || j->in.kind == EP_BLOCK) &&
+           !(j->opt->conv & DD_CONV_NOERROR);
+}
+
+/* Starts the thread; false (and the copy reads for itself) if it cannot. */
+static bool ra_start(job *j, readahead *ra, int64_t max_records, int64_t max_bytes)
+{
+    int i;
+
+    memset(ra, 0, sizeof *ra);
+    ra->j = j;
+    ra->max_records = max_records;
+    ra->max_bytes = max_bytes;
+    ra->n = (int)(RA_AHEAD / j->ibs);
+    if (ra->n < RA_SLOTS_MIN)
+        ra->n = RA_SLOTS_MIN;
+    if (ra->n > RA_SLOTS_MAX)
+        ra->n = RA_SLOTS_MAX;
+    InitializeSRWLock(&ra->lock);
+    InitializeConditionVariable(&ra->cv);
+    ra->slot[0].buf = j->ibuf;
+    for (i = 1; i < ra->n; i++)
+        if ((ra->slot[i].buf = alloc_buffer(j->ibs)) == NULL)
+            goto fail;
+    ra->thread = (HANDLE)_beginthreadex(NULL, 0, ra_thread, ra, 0, NULL);
+    if (ra->thread)
+        return true;
+fail:
+    for (i = 1; i < ra->n; i++)
+        if (ra->slot[i].buf)
+            VirtualFree(ra->slot[i].buf, 0, MEM_RELEASE);
+    return false;
+}
+
+/* The next block, as read_block would give it; NULL if stopped.  The
+   block's buffer stays the loop's until the next call. */
+static uint8_t *ra_take(job *j, readahead *ra, DWORD *req, DWORD *got, DWORD *e)
+{
+    ra_slot *s;
+
+    AcquireSRWLockExclusive(&ra->lock);
+    if (ra->held) {
+        ra->held = false;
+        ra->head = (ra->head + 1) % ra->n;
+        ra->filled--;
+        WakeAllConditionVariable(&ra->cv);
+    }
+    while (ra->filled == 0 && !ra->done) {
+        /* a read that hangs must not keep Stop from working */
+        SleepConditionVariableSRW(&ra->cv, &ra->lock, 100, 0);
+        if (ra->filled == 0 && !ra->done) {
+            ReleaseSRWLockExclusive(&ra->lock);
+            progress_tick(j);
+            if (cancelled(j))
+                CancelSynchronousIo(ra->thread);
+            AcquireSRWLockExclusive(&ra->lock);
+        }
+    }
+    if (ra->filled == 0) {
+        ReleaseSRWLockExclusive(&ra->lock);
+        return NULL;
+    }
+    ra->held = true;
+    s = &ra->slot[ra->head];
+    ReleaseSRWLockExclusive(&ra->lock);
+
+    *req = s->req;
+    *got = s->got;
+    *e = s->err;
+    j->st->bytes_unused += s->unused;
+    if (s->req)
+        after_read(j, s->buf, s->at, s->req, got, s->err);
+    return s->buf;
+}
+
+static void ra_stop(job *j, readahead *ra)
+{
+    int i;
+
+    AcquireSRWLockExclusive(&ra->lock);
+    ra->stop = true;
+    WakeAllConditionVariable(&ra->cv);
+    ReleaseSRWLockExclusive(&ra->lock);
+    if (cancelled(j))
+        CancelSynchronousIo(ra->thread);
+    WaitForSingleObject(ra->thread, INFINITE);
+    CloseHandle(ra->thread);
+    for (i = 1; i < ra->n; i++)
+        VirtualFree(ra->slot[i].buf, 0, MEM_RELEASE);
 }
 
 /* ---- writing ----------------------------------------------------------- */
@@ -374,15 +578,57 @@ static void hash_out(job *j, const uint8_t *buf, DWORD n)
     dd__sha256_update(j->out_hash, buf, n);
 }
 
+/* conv=sparse into a file that is all this run's: zeros are skipped in
+   pieces of HOLE_UNIT within a block too, not only whole blocks, as what
+   is skipped reads back as zeros anyway.  NTFS gives a sparse file space
+   in 16 clusters at a time, 64 KiB with the usual 4 KiB clusters. */
+#define HOLE_UNIT (64u << 10)
+
+static DWORD write_holes(job *j, const uint8_t *buf, DWORD n, DWORD *put)
+{
+    dd_endpoint *out = &j->out;
+    DWORD i = 0, e;
+
+    *put = 0;
+    while (i < n) {
+        /* pieces end on HOLE_UNIT boundaries of the file */
+        DWORD k = HOLE_UNIT - (DWORD)(out->pos % HOLE_UNIT), w;
+        if (k > n - i)
+            k = n - i;
+        if (all_zero(buf + i, k)) {
+            out->pos += k;
+            *put += k;
+            i += k;
+            continue;
+        }
+        while (i + k < n) {
+            DWORD c = n - i - k < HOLE_UNIT ? n - i - k : HOLE_UNIT;
+            if (all_zero(buf + i + k, c))
+                break;
+            k += c;
+        }
+        e = ep_write(out, buf + i, k, &w);
+        *put += w;
+        i += w;
+        if (e || w != k)
+            return e;
+    }
+    return 0;
+}
+
 static DWORD out_write(job *j, const uint8_t *buf, DWORD n, DWORD *put)
 {
     if (j->gpt_inline && j->st->bytes_written < 2 * (int64_t)j->gpt.ss)
         patch_gpt_inline(j, (uint8_t *)buf, n);     /* buf is one of our own buffers */
     hash_out(j, buf, n);
-    if ((j->opt->conv & DD_CONV_SPARSE) && ep_seekable(&j->out) && all_zero(buf, n)) {
-        j->out.pos += n;
-        *put = n;
-        return 0;
+    if ((j->opt->conv & DD_CONV_SPARSE) && ep_seekable(&j->out)) {
+        if (all_zero(buf, n)) {
+            j->out.pos += n;
+            *put = n;
+            return 0;
+        }
+        if (j->out_replaced && j->out.kind == EP_FILE && n > HOLE_UNIT)
+            return write_holes(j, buf, n, put);
     }
     return ep_write(&j->out, buf, n, put);
 }
@@ -818,6 +1064,8 @@ static dd_result copy_loop(job *j)
     bool write_stopped = false;
     bool read_stopped = false;  /* a read error ended it; one conv=noerror skips does not */
     bool tail_failed = false;   /* what follows the data (sparse end, GPT) failed */
+    readahead ra;
+    bool ahead;
     wchar_t m[256];
     DWORD e;
 
@@ -829,9 +1077,11 @@ static dd_result copy_loop(job *j)
             max_records = opt->count;
         }
     }
+    ahead = ra_wanted(j) && ra_start(j, &ra, max_records, max_bytes);
 
     for (;;) {
         DWORD req, nread, n;
+        uint8_t *ib = j->ibuf;
         step s;
 
         progress_tick(j);
@@ -844,10 +1094,23 @@ static dd_result copy_loop(job *j)
             break;
         req = (max_records >= 0 && st->r_partial + st->r_full >= max_records) ? (DWORD)max_bytes : j->ibs;
 
-        if (opt->conv & DD_CONV_SYNC)
-            memset(j->ibuf, 0, j->ibs);
-
-        e = read_block(j, j->ibuf, req, &nread);
+        if (ahead) {
+            DWORD want = req;
+            ib = ra_take(j, &ra, &req, &nread, &e);
+            if (!ib) {      /* cannot happen: the thread's last block ends the loop */
+                res = cancelled(j) ? DD_CANCELLED : DD_FAILED;
+                write_stopped = true;
+                break;
+            }
+            if (req != want && !e) {
+                e = ERROR_INVALID_DATA;     /* cannot happen: the thread counts as this loop does */
+                nread = 0;
+            }
+        } else {
+            if (opt->conv & DD_CONV_SYNC)
+                memset(ib, 0, j->ibs);
+            e = read_block(j, ib, req, &nread);
+        }
         if (e) {
             if (e == ERROR_OPERATION_ABORTED && cancelled(j)) {
                 res = DD_CANCELLED;
@@ -884,7 +1147,7 @@ static dd_result copy_loop(job *j)
 
         if (j->direct) {
             DWORD put = 0;
-            e = out_write(j, j->ibuf, n, &put);
+            e = out_write(j, ib, n, &put);
             st->bytes_written += put;
             if (e || put != n) {
                 s = write_failed(j, e);
@@ -899,17 +1162,19 @@ static dd_result copy_loop(job *j)
             continue;
         }
 
-        convert_case(j, j->ibuf, n);
+        convert_case(j, ib, n);
         if (opt->conv & DD_CONV_SWAB)
-            s = copy_simple(j, j->sbuf, swab_into(j, j->ibuf, n));
+            s = copy_simple(j, j->sbuf, swab_into(j, ib, n));
         else
-            s = copy_simple(j, j->ibuf, n);
+            s = copy_simple(j, ib, n);
         if (s != STEP_OK) {
             res = s == STEP_CANCEL ? DD_CANCELLED : DD_FAILED;
             write_stopped = true;
             break;
         }
     }
+    if (ahead)
+        ra_stop(j, &ra);
 
     if (!write_stopped && !j->direct) {
         if (j->saved_char >= 0) {
@@ -1131,6 +1396,11 @@ static dd_result setup_output(job *j, bool out_is_file)
 
     j->out_is_file = out_is_file && out->own_handle;
     fresh = j->out_is_file && !opt->seek && !(opt->conv & DD_CONV_NOTRUNC) && !(opt->oflags & DD_FLAG_APPEND);
+    if (opt->fit && (opt->conv & DD_CONV_SPARSE) && !fresh) {
+        dd__msg(j->cb, DD_MSG_ERROR, L"--fit with conv=sparse needs a new image file as output: '%ls' would keep its old data where blocks are skipped",
+                out->name);
+        return DD_FAILED;
+    }
     if (opt->hashes == DD_HASHES_ON || (opt->hashes == DD_HASHES_AUTO && j->in.kind == EP_BLOCK)) {
         wchar_t in_hashes[HASH_PATH];
         if (fresh && dd_hash_file_name(opt->output, j->out_hashes, HASH_PATH)) {
@@ -1538,6 +1808,10 @@ static void report_sparse(job *j, const dd_fs_report *rep)
         else
             dd__msg(j->cb, DD_MSG_INFO, L"%ls: no FAT, exFAT, NTFS, ext2/3/4 or swap found; reading all %ls%ls%ls",
                     label, b, v->note[0] ? L"; " : L"", v->note);
+    }
+    if (rep->unpartitioned > 0) {
+        dd_format_size(rep->unpartitioned, false, a, 32);
+        dd__msg(j->cb, DD_MSG_INFO, L"after the partitions: %ls in no partition, not read", a);
     }
     dd_format_size(rep->read, false, a, 32);
     dd_format_size(rep->size, false, b, 32);

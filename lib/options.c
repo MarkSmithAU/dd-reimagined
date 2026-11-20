@@ -327,9 +327,11 @@ bool dd__validate(const dd_options *o, wchar_t *err, size_t errlen)
             _snwprintf_s(err, errlen, _TRUNCATE, L"--fit sets the length itself; it cannot be combined with count, skip or seek");
             return false;
         }
-        if ((o->conv & (DD_CONV_SWAB | DD_CONV_LCASE | DD_CONV_UCASE | DD_CONV_SYNC | DD_CONV_SPARSE)) ||
+        /* conv=sparse is checked when the output is open: it keeps --fit's
+           image unchanged only in a new file, where skipped blocks read as zeros */
+        if ((o->conv & (DD_CONV_SWAB | DD_CONV_LCASE | DD_CONV_UCASE | DD_CONV_SYNC)) ||
             (o->oflags & DD_FLAG_APPEND)) {
-            _snwprintf_s(err, errlen, _TRUNCATE, L"--fit writes the image unchanged; it cannot be combined with conversions, sparse or append");
+            _snwprintf_s(err, errlen, _TRUNCATE, L"--fit writes the image unchanged; it cannot be combined with conversions or append");
             return false;
         }
     }

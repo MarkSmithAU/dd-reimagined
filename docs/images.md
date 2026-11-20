@@ -88,7 +88,11 @@ if=IMAGE` shows how much of each file system would be read.
     image is read whole.
 - **Read as usual:** partition tables, gaps between partitions (where boot
   loaders live), other file systems, and a partition's end past its file
-  system. LUKS, BitLocker, LVM, Linux RAID and bcache partitions (by
+  system.
+- **Free, not read:** the space after the last partition (and after the
+  partition tables and any ISO 9660 volume), which no partition table
+  points to: a 64 GB card holding a 32 GB image reads only the image's
+  used space. A GPT's backup at the end of the disk is still read. LUKS, BitLocker, LVM, Linux RAID and bcache partitions (by
   signature or partition type) are read whole, whatever old superblock
   remains.
 - **Read whole if untrustworthy:** a file system that is damaged, uses a

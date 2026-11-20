@@ -259,8 +259,10 @@ static void usage(void)
            L"                  read, so an image of a mostly empty card is quick to make\n"
            L"                  and compresses well (--xz, or conv=sparse for a sparse\n"
            L"                  file).  Partition tables, gaps and other partitions are\n"
-           L"                  read as usual.  A file system not cleanly unmounted is\n"
-           L"                  read whole.  With --layout, shows what would be read.\n"
+           L"                  read as usual; the space after the last partition is\n"
+           L"                  free (a GPT's backup is still read).  A file system\n"
+           L"                  not cleanly unmounted is read whole.  With --layout,\n"
+           L"                  shows what would be read.\n"
            L"                  An xz-compressed if= is read in order, so its file systems\n"
            L"                  are mapped first, decompressing the parts they need; its\n"
            L"                  free space is then read and written as zeros\n"
@@ -472,6 +474,10 @@ static void print_fs_report(const dd_fs_report *r, const wchar_t *heading)
         oprint(L"%3d  %-29ls %-12ls %-8ls %-12ls %ls%ls%ls\n", v->partition, start, size,
                v->type[0] ? v->type : L"-", v->sparse ? used : L"all",
                v->unclean ? L"unclean" : L"", v->unclean && v->note[0] ? L": " : L"", v->note);
+    }
+    if (r->unpartitioned > 0) {
+        dd_format_size(r->unpartitioned, false, size, 32);
+        oprint(L"after the partitions: %ls in no partition, not read\n", size);
     }
     dd_format_size(r->read, false, used, 32);
     dd_format_size(r->size, false, size, 32);

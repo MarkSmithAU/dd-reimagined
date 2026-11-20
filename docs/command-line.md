@@ -89,7 +89,8 @@ devices:
 in `B` counts bytes, not blocks (`skip=1000B`).
 
 **Conversions** (`conv=`): `lcase`, `ucase`, `sparse` (seek over all-zero
-output blocks), `swab`, `sync` (zero-pad input blocks to `ibs`), `excl`
+output blocks; into a new file, over every all-zero 64 KiB of a block
+too), `swab`, `sync` (zero-pad input blocks to `ibs`), `excl`
 (fail if the output exists), `nocreat`, `notrunc`, `noerror` (continue
 after read errors), `fdatasync`, `fsync`. Without `notrunc` the output is
 truncated.

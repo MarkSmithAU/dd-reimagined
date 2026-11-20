@@ -154,6 +154,32 @@ try {
     Check 'GPT data ends at the end of the last partition' ($gEnd -eq $gptEnd) "data end $gEnd, Windows says $gptEnd"
     Check 'GPT image has a valid backup' ($r.Out -notmatch 'note:') $r.Out
 
+    # --sparse-read: after the partitions is free space, short of the backup GPT
+    $junk = [IO.File]::ReadAllBytes((F 'gpt.img'))
+    $backup = $junk.Length - 33 * 512
+    $rnd = New-Object byte[] ($backup - $gptEnd); (New-Object Random 7).NextBytes($rnd)
+    [Array]::Copy($rnd, 0, $junk, $gptEnd, $rnd.Length)
+    [IO.File]::WriteAllBytes((F 'gpt-junk.img'), $junk)
+    $r = Run "if=gpt-junk.img of=gpt-sparse.img bs=1M --sparse-read"
+    $out = [IO.File]::ReadAllBytes((F 'gpt-sparse.img'))
+    $head = $true; $zeros = $true; $tail = $true
+    for ($i = 0; $i -lt $gptEnd; $i += 4096) { if ([BitConverter]::ToString($junk, $i, 4096) -ne [BitConverter]::ToString($out, $i, 4096)) { $head = $false; break } }
+    for ($i = $gptEnd; $i -lt $backup; $i++) { if ($out[$i]) { $zeros = $false; break } }
+    for ($i = $backup; $i -lt $junk.Length; $i++) { if ($out[$i] -ne $junk[$i]) { $tail = $false; break } }
+    Check '--sparse-read of GPT: after the partitions not read, said so' ($r.Code -eq 0 -and $r.Err -match 'after the partitions: [\d.]+ MiB in no partition, not read') $r.Err
+    Check '... the space after the partitions is zeros' ($out.Length -eq $junk.Length -and $zeros)
+    Check '... the backup GPT is copied, unchanged' $tail
+    Check '... the file systems'' part matches up to the end of the partitions' $head
+    $r = Run "--layout if=gpt-sparse.img"
+    Check '... and the sparse image''s backup GPT is valid' ($r.Code -eq 0 -and $r.Out -notmatch 'note:') $r.Out
+    # --fit with conv=sparse, into a new file: the same image, with holes
+    $r = Run "if=gpt-junk.img of=gpt-fit-sp.img bs=1M --sparse-read --fit conv=sparse --verify"
+    $r2 = Run "if=gpt-junk.img of=gpt-fit.img bs=1M --sparse-read --fit status=none"
+    Check '--fit with conv=sparse into a new file: allowed, verified, and as without it' ($r.Code -eq 0 -and $r.Err -match "verified: 'gpt-fit-sp\.img'" -and
+        (Get-FileHash (F 'gpt-fit-sp.img')).Hash -eq (Get-FileHash (F 'gpt-fit.img')).Hash) $r.Err
+    $r = Run "if=gpt-junk.img of=gpt-fit-sp.img bs=1M --fit conv=sparse,notrunc"
+    Check '... but not into a file it would keep old data in' ($r.Code -ne 0 -and $r.Err -match '--fit with conv=sparse needs a new image file') $r.Err
+
     # --- no partition table ----------------------------------------------------
     $blob = New-Object byte[] 1048576
     (New-Object Random 3).NextBytes($blob)

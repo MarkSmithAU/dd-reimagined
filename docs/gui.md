@@ -61,7 +61,11 @@ Reading:
   is refused.
 - *Only used space; free space as zeros* (`--sparse-read`), unticked by
   default; the summary says how much will be read. Ticking it offers
-  *Allow unclean file systems* (`--allow-unclean`).
+  *Allow unclean file systems* (`--allow-unclean`). It and *Raw* exclude
+  each other: Raw copies what lies after the partitions, which Only used
+  space treats as free, so ticking one unticks the other. Into an
+  uncompressed image file, free space is left as holes in a sparse file
+  (`conv=sparse`) rather than written.
 - *Lock the source's volumes* (`--lock-input`), for disk input, unticked
   by default. A FAT card Windows has just written to may show as not
   clean; locking makes Windows write its changes first, so it can be read

@@ -55,7 +55,8 @@ using System;
 using System.IO;
 public static class SparseCheck {
     // { used blocks that differ, free blocks zeroed, free nonzero blocks kept, bytes outside that differ, the first kept block }
-    public static long[] Run(string input, string output, long fsOffset, int bs, long count, string free) {
+    // From tail (the end of the partitions) on, the output must be zeros.
+    public static long[] Run(string input, string output, long fsOffset, int bs, long count, string free, long tail) {
         bool[] isFree = new bool[count];
         foreach (string part in free.Split(',')) {
             string p = part.Trim();
@@ -70,7 +71,7 @@ public static class SparseCheck {
         if (x.Length != y.Length) { r[3] = -1; return r; }
         long end = fsOffset + count * bs;
         for (long i = 0; i < x.Length; i++)
-            if ((i < fsOffset || i >= end) && x[i] != y[i]) r[3]++;
+            if (i >= tail ? y[i] != 0 : (i < fsOffset || i >= end) && x[i] != y[i]) r[3]++;
         for (long blk = 0; blk < count; blk++) {
             long o = fsOffset + blk * bs;
             bool same = true, zero = true, inZero = true;
@@ -93,8 +94,25 @@ public static class SparseCheck {
         for (int i = 0; i < len; i++) if (x[i] != y[i]) return false;
         return true;
     }
+    // output is input up to tail, and zeros from there
+    public static bool SameThenZeros(string a, string b, long tail) {
+        byte[] x = File.ReadAllBytes(a), y = File.ReadAllBytes(b);
+        if (x.Length != y.Length) return false;
+        for (long i = 0; i < x.Length; i++) if (i < tail ? x[i] != y[i] : y[i] != 0) return false;
+        return true;
+    }
 }
 '@
+
+# Where the partitions end ("data ends at"); the size of an image without a
+# partition table.  Sparse reading writes zeros from there on.
+function DataEnd([string]$img) {
+    $r = Run "--layout if=$img"
+    if ($r.Out -match 'data ends at .*?\((\d+)\)') { return [long]$Matches[1] }
+    (Get-Item (F $img)).Length
+}
+
+function Tail([string]$in, [string]$out) { [SparseCheck]::SameThenZeros((F $in), (F $out), (DataEnd $in)) }
 
 function Fixture([string]$name) {
     $info = @{}
@@ -106,7 +124,7 @@ function Fixture([string]$name) {
 }
 
 function Blocks([string]$in, [string]$out, $info, [long]$offset = 0) {
-    $r = [SparseCheck]::Run((F $in), (F $out), $offset, [int]$info.block_size, [long]$info.block_count, $info.free)
+    $r = [SparseCheck]::Run((F $in), (F $out), $offset, [int]$info.block_size, [long]$info.block_count, $info.free, (DataEnd $in))
     [pscustomobject]@{ Bad = $r[0]; Zeroed = $r[1]; Kept = $r[2]; Outside = $r[3]; FirstKept = $r[4] }
 }
 
@@ -212,7 +230,8 @@ try {
     Check 'MBR: the ext4 partition is sparse, the unknown one read whole' ($r.Code -eq 0 -and $r.Err -match 'partition 1 \(ext4\): reading the' -and
         $r.Err -match 'partition 2: no FAT, exFAT, NTFS, ext2/3/4 or swap found; reading all 2\.0 MiB') $r.Err
     $b = Blocks 'mbr.img' 'mbr.out' (Fixture 'ext4') 1MB
-    Check 'MBR: the table, gaps and other partition are identical; ext4''s free space zeroed' ($b.Bad -eq 0 -and $b.Outside -eq 0 -and $b.Kept -eq 0 -and $b.Zeroed -gt 0) ($b | Out-String)
+    Check 'MBR: the table, gaps and other partition are identical; ext4''s free space and the space after the partitions zeroed' ($b.Bad -eq 0 -and $b.Outside -eq 0 -and $b.Kept -eq 0 -and $b.Zeroed -gt 0 -and
+        $r.Err -match 'after the partitions: 1\.0 MiB in no partition, not read') ($b | Out-String)
     $r = Run "--layout --sparse-read if=mbr.img"
     Check '--layout --sparse-read lists the file systems' ($r.Code -eq 0 -and $r.Out -match "File systems \(--sparse-read\)" -and
         $r.Out -match '(?m)^\s+1\s+1\.0 MiB.*ext4\s+[\d.]+ [KM]iB' -and $r.Out -match '(?m)^\s+2\s+.*\s-\s+all' -and $r.Out -match 'reads .* of 20 MiB') $r.Out
@@ -224,7 +243,7 @@ try {
     Entry 1 0x0C (16MB) 2MB         # now partition 2 overlaps the end of partition 1
     [IO.File]::WriteAllBytes((F 'overlap.img'), $img)
     $r = Run "if=overlap.img of=overlap.out bs=1M --sparse-read"
-    Check 'overlapping partitions are read whole' ($r.Code -eq 0 -and $r.Err -match 'partition 1 \(ext4\): reading all 16 MiB: it overlaps partition 2' -and (Hash 'overlap.out') -eq (Hash 'overlap.img')) $r.Err
+    Check 'overlapping partitions are read whole' ($r.Code -eq 0 -and $r.Err -match 'partition 1 \(ext4\): reading all 16 MiB: it overlaps partition 2' -and (Tail 'overlap.img' 'overlap.out')) $r.Err
     Entry 1 0x0C 17MB 8MB           # partition 2 runs past the end of the image
     [IO.File]::WriteAllBytes((F 'past.img'), $img)
     $r = Run "if=past.img of=past.out bs=1M --sparse-read"
@@ -251,10 +270,10 @@ try {
     $r = Run "if=ntfs-dirty.img of=ntfs-dirty.out bs=1M --sparse-read --allow-unclean"
     Check 'NTFS marked dirty: read whole, even with --allow-unclean, saying why' ($r.Code -eq 0 -and
         $r.Err -match 'partition 1 \(NTFS\): reading all 14 MiB: it was not cleanly unmounted, says \$Volume; dd cannot replay an NTFS log' -and
-        $r.Err -notmatch '--allow-unclean reads' -and (Hash 'ntfs-dirty.out') -eq (Hash 'ntfs-dirty.img')) $r.Err
+        $r.Err -notmatch '--allow-unclean reads' -and (Tail 'ntfs-dirty.img' 'ntfs-dirty.out')) $r.Err
     $r = Run "if=ntfs-inuse.img of=ntfs-inuse.out bs=1M --sparse-read"
     Check 'NTFS read while mounted (its log in use): read whole' ($r.Code -eq 0 -and
-        $r.Err -match 'partition 1 \(NTFS\): reading all 14 MiB: its log needs replaying' -and (Hash 'ntfs-inuse.out') -eq (Hash 'ntfs-inuse.img')) $r.Err
+        $r.Err -match 'partition 1 \(NTFS\): reading all 14 MiB: its log needs replaying' -and (Tail 'ntfs-inuse.img' 'ntfs-inuse.out')) $r.Err
     $r = Run "--layout --sparse-read if=ntfs-dirty.img"
     Check '--layout marks the dirty NTFS volume' ($r.Code -eq 0 -and $r.Out -match 'NTFS\s+all\s+unclean') $r.Out
 
@@ -348,7 +367,7 @@ try {
     }
     $info = Fixture 'mbr-ext4'
     $b = Blocks 'mbr-ext4.img' 'z-mbr-ext4-out.img' $info ([long]$info.offset)
-    Check 'the compressed MBR image: table, gap and tail identical; the partition''s free space zeroed' ($b.Bad -eq 0 -and $b.Outside -eq 0 -and $b.Kept -eq 0 -and $b.Zeroed -gt (FreeBlocks $info) * 0.9) ($b | Out-String)
+    Check 'the compressed MBR image: table and gap identical; the partition''s free space and what follows it zeroed' ($b.Bad -eq 0 -and $b.Outside -eq 0 -and $b.Kept -eq 0 -and $b.Zeroed -gt (FreeBlocks $info) * 0.9) ($b | Out-String)
     $r = Run "--layout --sparse-read if=z-mbr-ext4.img.xz"
     Check '--layout --sparse-read maps a compressed image' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s+1\s+1\.0 MiB.*ext4') $r.Out
     $r = Run "--layout --sparse-read if=`"$fixtures\ext4.img.xz`""

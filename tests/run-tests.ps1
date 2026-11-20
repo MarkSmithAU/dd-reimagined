@@ -154,6 +154,26 @@ try {
     Check 'conv=sparse content' (Same $z (Bytes 'sp.bin')) $r.Err
     Check 'conv=sparse sets attribute' (((Get-Item (F 'sp.bin')).Attributes -band [IO.FileAttributes]::SparseFile) -ne 0)
 
+    # sparse into a new file: zeros inside a block that holds data are holes too
+    if (-not ('DDTest.Alloc' -as [type])) {
+        Add-Type -Namespace DDTest -Name Alloc -MemberDefinition '[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern uint GetCompressedFileSizeW(string n, out uint hi);'
+    }
+    $big = New-Object byte[] (4MB)
+    [Array]::Copy($d, 0, $big, 0, 100)
+    [Array]::Copy($d, 0, $big, 2MB + 10, 100)
+    $big[4MB - 1] = 7
+    [IO.File]::WriteAllBytes((F 'zb.bin'), $big)
+    $r = DDRun 'if=zb.bin of=spb.bin bs=4M conv=sparse'
+    $hi = [uint32]0
+    $lo = [DDTest.Alloc]::GetCompressedFileSizeW((F 'spb.bin'), [ref]$hi)
+    $alloc = ([uint64]$hi -shl 32) + $lo
+    Check 'conv=sparse content, zeros within a block' (Same $big (Bytes 'spb.bin')) $r.Err
+    Check 'conv=sparse leaves holes within a block' ($alloc -le 256KB) "allocated $alloc bytes of 4 MiB"
+    # into an existing file (notrunc) a block with data is written whole, as GNU dd does
+    New-Data 'old.bin' (4MB) 5 | Out-Null
+    $r = DDRun 'if=zb.bin of=old.bin bs=4M conv=sparse,notrunc'
+    Check 'conv=sparse,notrunc writes a block with data whole' (Same $big (Bytes 'old.bin')) $r.Err
+
     # --- creation flags -----------------------------------------------------
     $r = DDRun 'if=k.bin of=k.bin2 conv=excl'
     Check 'excl creates' ($r.Code -eq 0)

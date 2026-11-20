@@ -1,5 +1,31 @@
 # Changes
 
+## Unreleased
+
+- **Sparse reading skips the space after the last partition.** No
+  partition table points there, so `--sparse-read` now treats it as free
+  space instead of reading it. A 64 GB card holding a 32 GB Raspberry Pi
+  image read 40 GiB before and reads 9.8 GiB now. A GPT's backup at the
+  end of the disk is still read. dd says how much was skipped ("after the
+  partitions: ... not read"), and so does `--layout --sparse-read`.
+- **A disk or image file is read ahead on a thread of its own**, so
+  hashing and writing the output no longer wait for each read, nor reads
+  for them. Imaging the same card with *Only used space* took 148 s and
+  now takes 137 s; reading alone takes 132 s.
+- **`conv=sparse` leaves holes within blocks** when writing a new file:
+  every all-zero 64 KiB of a block is skipped, not only all-zero blocks.
+  The card's image takes 9.5 GiB on disk instead of 12.6 GiB. Into an
+  existing file (`conv=notrunc`, `seek=`) a block with data is still
+  written whole, as GNU dd does.
+- **`--fit` works with `conv=sparse`** when the output is a new image
+  file, where skipped blocks read back as zeros. Into anything that keeps
+  old data (a disk, `conv=notrunc`) it is refused.
+- dd-gui.exe:
+  - *Raw* and *Only used space* exclude each other: ticking one unticks
+    the other.
+  - With *Only used space*, an uncompressed image file is written as a
+    sparse file (`conv=sparse`), so free space takes no room.
+
 ## 1.0.2 (2026-11-14)
 
 - **Compressed images are mapped for each run; the sparse map file is

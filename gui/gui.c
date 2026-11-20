@@ -902,11 +902,10 @@ static void sparse_summary(wchar_t *text, size_t n)
         return;
     }
     {
-        /* everything past the data end is outside any file system, so all
-           of it counts as read: --fit leaves it out */
+        /* past the data end, only a GPT's backup is read: --fit leaves it out */
         int64_t read = g.fs->read, total = g.fs->size;
         if (fitting() && l->data_end < total) {
-            read -= total - l->data_end;
+            read -= total - l->data_end - g.fs->unpartitioned;
             total = l->data_end;
         }
         dd_format_size_exact(read, true, true, size, DD_SIZE_EXACT_CHARS);
@@ -1512,6 +1511,9 @@ static void options_from_controls(dd_options *o, const dd_disk_info *target)
         o->xz_level = xz_level();
         o->filter = DD_FILTER_FILE;
         o->keep_incomplete = !ticked(IDC_DELPARTIAL);
+        /* free space is zeros: a raw image file skips them, as a sparse file */
+        if (o->sparse_read && o->xz_level < 0)
+            o->conv |= DD_CONV_SPARSE;
     }
     if (source_is_disk())
         o->lock_input = ticked(IDC_LOCKIN);
@@ -2236,13 +2238,22 @@ static INT_PTR CALLBACK dialog_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
                 show_fit();
             }
             return TRUE;
+        /* Raw copies what lies outside the partitions; Only used space
+           treats that as free space: one or the other */
         case IDC_FIT:
             if (HIWORD(wp) == BN_CLICKED) {
+                if (ticked(IDC_FIT) && ticked(IDC_SPARSE)) {
+                    CheckDlgButton(dlg, IDC_SPARSE, BST_UNCHECKED);
+                    load_layout();  /* the Sparse read column and summary change */
+                }
                 show_fit();
                 update_controls();
             }
             return TRUE;
         case IDC_SPARSE:
+            if (HIWORD(wp) == BN_CLICKED && ticked(IDC_SPARSE))
+                CheckDlgButton(dlg, IDC_FIT, BST_UNCHECKED);
+            /* fall through */
         case IDC_UNCLEAN:
             if (HIWORD(wp) == BN_CLICKED)
                 load_layout();      /* the Sparse read column and summary change */

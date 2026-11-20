@@ -526,6 +526,8 @@ static bool read_gpt(image *im, dd_layout *l, const uint8_t *mbr, DWORD ss)
         end = max64(end, l->iso_size < iso_limit ? l->iso_size : iso_limit);
     l->data_end = (end + ss - 1) / ss * ss;     /* an ISO can end mid-sector */
     l->gpt_reserve = (int64_t)(array_sectors(&g, ss) + 1) * ss;
+    if (g.alt_lba > array_sectors(&g, ss))
+        l->gpt_backup_off = (int64_t)(g.alt_lba - array_sectors(&g, ss)) * ss;
     return true;
 }
 

@@ -6,7 +6,9 @@
     The used-space map of an input, for sparse reading: which bytes the
     file systems on it hold data in.  The input's partition table gives the
     volumes (or the input is one volume); each is offered to the drivers in
-    drivers[] (see fs.h).  Every byte no driver vouches for is read.
+    drivers[] (see fs.h).  Every byte no driver vouches for is read, except
+    the space after the partitions: no partition table points there, so it
+    is free space too (a GPT's backup, which lives there, is still read).
 
     A file system is read whole, whatever its driver says, when it might
     share bytes with something else: it overlaps another partition, or it
@@ -160,6 +162,7 @@ typedef struct region {
     int64_t  bits_start, bits_end; /* where the bits apply */
     uint32_t unit;
     uint8_t *bits;
+    bool     free;                 /* all of it is free: no bits */
 } region;
 
 struct dd__fsmap {
@@ -240,6 +243,10 @@ int64_t dd__fsmap_run(const dd__fsmap *fm, int64_t pos, int64_t max, bool *used)
     r = &fm->r[lo];
     if (pos < r->start)
         return r->start - pos < max ? r->start - pos : max;
+    if (r->free) {
+        *used = false;
+        return r->end - pos < max ? r->end - pos : max;
+    }
     if (pos < r->bits_start)
         return r->bits_start - pos < max ? r->bits_start - pos : max;
     if (pos >= r->bits_end)
@@ -546,6 +553,31 @@ dd__fsmap *dd__fsmap_build(const dd__fs_source *src, bool allow_unclean, dd_fs_r
         r->bits = vols[i].m.bits;
         vols[i].m.bits = NULL;          /* the region owns them now */
         rep->vols[i].sparse = true;
+    }
+
+    /* after the partitions (and their tables, and any ISO 9660 volume): no
+       partition table points there, so it is free space, short of where a
+       GPT keeps its backup.  Without a partition table, nothing is. */
+    if (!src->is_volume && l->scheme != DD_SCHEME_NONE) {
+        int64_t from = l->data_end, to = src->size;
+        if (l->scheme == DD_SCHEME_GPT) {
+            to -= l->gpt_reserve;
+            if (l->gpt_backup_off < to)
+                to = l->gpt_backup_off;
+        }
+        if (from < to) {
+            region *r = add_region(fm);
+            if (!r) {
+                *err = ERROR_NOT_ENOUGH_MEMORY;
+                dd__fsmap_free(fm);
+                fm = NULL;
+                goto out;
+            }
+            r->start = r->bits_start = r->bits_end = from;
+            r->end = to;
+            r->free = true;
+            rep->unpartitioned = to - from;
+        }
     }
     qsort(fm->r, fm->n, sizeof *fm->r, by_start);
 
